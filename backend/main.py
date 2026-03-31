@@ -10,10 +10,10 @@ app = FastAPI(
     docs_url=f"{settings.API_V1_STR}/docs"
 )
 
-# Standard CORS Config for standard React UI origins 
+# CORS Config using Synchronized Settings
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "*"],
+    allow_origins=[origin.strip() for origin in settings.ALLOWED_ORIGINS.split(",")],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
