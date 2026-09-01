@@ -5,7 +5,7 @@ Deterministic verification of the complete Context-Aware Knowledge + RAG subsyst
     1. Document chunking, hashing, and token estimation
     2. Chunk deduplication
     3. Deterministic local & hybrid embeddings
-    4. PostgreSQL + pgvector vector indexing and similarity query (ChromaDB removed)
+    4. PostgreSQL + pgvector vector indexing and similarity query
     5. Metadata filtering (category, source, custom tags)
     6. Relevance threshold filtering
     7. Top-K constraint adherence
@@ -35,7 +35,7 @@ from knowledge.knowledge_schemas import (
 )
 from knowledge.rag_service import RAGService, SEED_DOCUMENTS
 from knowledge.retriever import KnowledgeRetriever
-from knowledge.vector_store import ChromaVectorStore
+from knowledge.postgres_vector_store import PostgresPgVectorStore
 from orchestration.safety_policy import SafetyPolicyEngine
 from orchestration.safety_schemas import (
     ActionType,
@@ -64,7 +64,7 @@ def local_embeddings():
 
 @pytest.fixture
 def in_memory_store(local_embeddings):
-    return ChromaVectorStore(
+    return PostgresPgVectorStore(
         embedding_provider=local_embeddings,
         in_memory=True,
     )
@@ -260,7 +260,7 @@ def test_embedding_fallback_resilience():
 
 def test_vector_store_error_containment():
     # Create retriever with closed/cleared vector store
-    store = ChromaVectorStore(in_memory=True)
+    store = PostgresPgVectorStore(in_memory=True)
     retriever = KnowledgeRetriever(vector_store=store)
     # Query on empty store
     res = retriever.retrieve(query="something")

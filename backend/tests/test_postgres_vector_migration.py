@@ -12,7 +12,7 @@ Deterministic verification for:
     8. SAFETY INVARIANCE: Past memory or retrieved context NEVER overrides deterministic policies
     9. PostgreSQL connection failure resilience & fallback
    10. Embedding provider failure handling
-   11. Comparative evaluation: ChromaDB baseline vs. PostgreSQL + pgvector
+   11. Reproducibility evaluation: PostgreSQL + pgvector
 """
 
 import time
@@ -333,7 +333,7 @@ def test_postgres_connection_failure_resilience():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7. PostgreSQL + pgvector Reproducibility Benchmark (ChromaDB removed)
+# 7. PostgreSQL + pgvector Reproducibility Benchmark
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_pgvector_reproducibility_benchmark(local_embeddings):
@@ -341,9 +341,7 @@ def test_pgvector_reproducibility_benchmark(local_embeddings):
     Validates PostgreSQL + pgvector retrieval quality and latency over
     the standardized 4-query benchmark across two independent store instances.
 
-    ChromaDB has been removed from this project. PostgreSQL + pgvector is
-    the sole vector backend. This test replaces the former Chroma-vs-Postgres
-    comparative benchmark.
+    PostgreSQL + pgvector is the sole vector backend.
     """
     # Two independent in-memory stores to verify reproducibility
     pg_store_a = PostgresPgVectorStore(
