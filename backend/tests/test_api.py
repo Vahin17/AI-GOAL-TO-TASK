@@ -1,12 +1,14 @@
 from fastapi.testclient import TestClient
-from backend.main import app
+from main import app
 
 client = TestClient(app)
 
 def test_health_check_endpoint():
     response = client.get("/api/v1/health")
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "service": "planning-engine"}
+    data = response.json()
+    assert data["status"] == "ok"
+    assert data["service"] == "planning-engine"
 
 def test_plan_generation_fallback_route():
     # Sending a test payload

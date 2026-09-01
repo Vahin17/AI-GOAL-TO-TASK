@@ -1,6 +1,6 @@
-from backend.ai.base_provider import LLMProvider
-from backend.schemas.models import PlanGraphResponse
-from backend.core.config import settings
+from ai.base_provider import LLMProvider
+from schemas.models import PlanGraphResponse
+from core.config import settings
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
@@ -27,23 +27,28 @@ class LangChainProvider(LLMProvider):
              - X-coordinates dictate parallelism or distinct branches. Central nodes are generally at X=250.
              - Keep step counts lean and strictly aligned with fulfilling the User's goal safely.
              
+             {rag_context_block}
+             
              {format_instructions}
              """),
-            ("user", "User Goal: {goal}")
+            ("human", "Goal to decompose: {goal}"),
         ])
-        
-    def generate_plan(self, goal: str) -> PlanGraphResponse:
+
+    async def generate_plan(self, goal: str, rag_context: str = "") -> PlanGraphResponse:
         """
         Executes the LangChain chain, resolving validation rules automatically via OutputParser.
         """
         if not self.llm:
             raise ValueError("LLM Provider requires an external Provider API key (e.g. OPENAI_API_KEY) in the .env or configuration.")
             
+        rag_context_block = f"\nRelevant Domain Context:\n{rag_context}\n" if rag_context else ""
+
         formatted_prompt = self.prompt.format_prompt(
-            goal=goal, 
+            goal=goal,
+            rag_context_block=rag_context_block,
             format_instructions=self.parser.get_format_instructions()
         )
         
-        # Invoke completion and parse raw string -> Pydantic schemas mapped structure
-        response = self.llm.invoke(formatted_prompt.to_messages())
+        # Invoke completion and parse raw string -> Pydantic schemas mapped structure via async call
+        response = await self.llm.ainvoke(formatted_prompt.to_messages())
         return self.parser.parse(response.content)

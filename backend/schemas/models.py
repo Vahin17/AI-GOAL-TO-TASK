@@ -29,11 +29,19 @@ class PlanGraphMetadata(BaseModel):
     intent: str = Field(..., description="The intent behind the generated operation.")
     confidence: float = Field(..., description="Model's confidence score ranging from 0.0 to 1.0.")
     reasoning_summary: str = Field(..., description="Brief summary of the reasoning used to logically construct these task nodes.")
+    # Phase 6: Knowledge provenance details
+    knowledge_sources: Optional[List[str]] = Field(default_factory=list, description="Knowledge base sources used to ground the plan.")
+    knowledge_chunk_count: int = Field(default=0, description="Number of retrieved knowledge chunks injected into prompt.")
 
 class PlanGraphResponse(BaseModel):
     """
     Top level structured extraction model that nests the proper React Flow compatible nodes and edge graph response.
     """
+    public_id: Optional[str] = Field(None, description="Public human-readable ID for the plan.")
     nodes: List[TaskNode] = Field(..., description="List of React Flow compatible task nodes.")
     edges: List[TaskEdge] = Field(..., description="List of React Flow compatible edges between the task nodes.")
     metadata: PlanGraphMetadata = Field(..., description="Metadata summarizing the AI response intent and reasoning.")
+    # Phase 5: Safety decisions attached after batch evaluation, not serialized in API response
+    safety_decisions: Optional[Dict[str, Any]] = Field(None, exclude=True, description="Internal: SafetyDecision map from SafetyEngine.")
+    # Phase 6: Detailed RAG retrieval provenance
+    provenance: Optional[Dict[str, Any]] = Field(default=None, description="Detailed RAG retrieval provenance metadata.")

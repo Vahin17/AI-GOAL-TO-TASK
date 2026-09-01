@@ -1,7 +1,7 @@
 import uuid
-from backend.schemas.models import TaskNode, TaskEdge, PlanGraphMetadata, PlanGraphResponse
+from schemas.models import TaskNode, TaskEdge, PlanGraphMetadata, PlanGraphResponse
 
-def generate_fallback_plan(goal: str) -> PlanGraphResponse:
+async def generate_fallback_plan(goal: str) -> PlanGraphResponse:
     """
     Constructs a rigid, rule-based safe graph layout when the generative provider fails.
     This guarantees the frontend React Flow canvas always has actionable nodes.

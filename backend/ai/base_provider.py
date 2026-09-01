@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from backend.schemas.models import PlanGraphResponse
+from schemas.models import PlanGraphResponse
 
 class LLMProvider(ABC):
     """
@@ -9,12 +9,13 @@ class LLMProvider(ABC):
     """
     
     @abstractmethod
-    def generate_plan(self, goal: str) -> PlanGraphResponse:
+    async def generate_plan(self, goal: str, rag_context: str = "") -> PlanGraphResponse:
         """
-        Takes a natural language goal and converts it to a structured React Flow layout.
+        Takes a natural language goal and optional RAG context and converts it to a structured React Flow layout.
         
         Args:
             goal (str): The raw objective provided by the user.
+            rag_context (str): Optional retrieved knowledge context to ground planning.
 
         Returns:
             PlanGraphResponse: Verified Pydantic schema structuring the resulting task graph.

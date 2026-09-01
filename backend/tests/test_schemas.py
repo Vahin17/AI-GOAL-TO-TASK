@@ -1,4 +1,4 @@
-from backend.schemas.models import (
+from schemas.models import (
     TaskNode,
     TaskEdge,
     PlanGraphMetadata,

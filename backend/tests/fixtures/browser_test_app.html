@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>AI Goal-To-Task Engine - Browser Test Page</title>
+    <style>
+        body { font-family: sans-serif; margin: 40px; background: #0f172a; color: #f8fafc; }
+        .container { max-width: 600px; margin: auto; padding: 24px; border: 1px solid #334155; border-radius: 8px; }
+        input { width: 100%; padding: 10px; margin-bottom: 12px; border-radius: 4px; border: 1px solid #475569; background: #1e293b; color: #fff; box-sizing: border-box; }
+        button { padding: 10px 20px; background: #3b82f6; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
+        button:hover { background: #2563eb; }
+        #output-area { margin-top: 20px; padding: 16px; background: #1e293b; border-radius: 4px; border-left: 4px solid #10b981; }
+        #counter-area { margin-top: 10px; color: #94a3b8; font-size: 14px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1 id="page-title">Deterministic Browser Test Suite</h1>
+        <p id="page-desc">Automated validation target for AI Goal-To-Task Planning Engine Playwright execution.</p>
+        <input type="text" id="query-input" placeholder="Enter target query..." />
+        <button id="submit-btn" onclick="handleSubmit()">Execute Task</button>
+        <div id="output-area" style="display: none;"></div>
+        <div id="counter-area">Execution Count: <span id="click-count">0</span></div>
+    </div>
+    <script>
+        let count = 0;
+        function handleSubmit() {
+            count++;
+            const inputVal = document.getElementById('query-input').value;
+            const output = document.getElementById('output-area');
+            const counter = document.getElementById('click-count');
+            output.innerText = 'Processed: ' + inputVal;
+            output.style.display = 'block';
+            counter.innerText = count.toString();
+        }
+    </script>
+</body>
+</html>

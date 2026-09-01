@@ -1,12 +1,14 @@
-from backend.ai.fallback_rules import generate_fallback_plan
-from backend.schemas.models import PlanGraphResponse
+import pytest
+from ai.fallback_rules import generate_fallback_plan
+from schemas.models import PlanGraphResponse
 
-def test_fallback_generates_valid_schema():
+@pytest.mark.asyncio
+async def test_fallback_generates_valid_schema():
     """
     Simulates a total systemic LLM failure ensuring our React Flow canvas remains highly resilient and safe.
     """
     goal = "Build a rocket"
-    fallback_response = generate_fallback_plan(goal)
+    fallback_response = await generate_fallback_plan(goal)
     
     # Instance Assertions
     assert isinstance(fallback_response, PlanGraphResponse)

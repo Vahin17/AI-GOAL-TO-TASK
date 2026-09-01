@@ -1,6 +1,10 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 from typing import List, Union
+from pathlib import Path
+
+# Project Root (3 levels up from backend/core/config.py)
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
 class Settings(BaseSettings):
     # API & App settings
@@ -21,7 +25,7 @@ class Settings(BaseSettings):
 
     # Server settings
     BACKEND_HOST: str = "127.0.0.1"
-    BACKEND_PORT: int = 8000
+    BACKEND_PORT: int = 8001
     FRONTEND_URL: str = "http://localhost:3000"
 
     # Environment
@@ -38,9 +42,18 @@ class Settings(BaseSettings):
     ENABLE_FALLBACK_RULES: bool = True
     ENABLE_EXECUTION_ENGINE: bool = True
     ENABLE_MEMORY_LAYER: bool = True
+    ENABLE_RAG: bool = True
+
+    # Phase 7: PostgreSQL + pgvector & Semantic Memory Settings
+    POSTGRES_URI: str = "postgresql://postgres:postgres@localhost:5432/ai_goal_planner"
+    PGVECTOR_TABLE: str = "knowledge_chunks"
+    PGVECTOR_INDEX_TYPE: str = "hnsw"
+    RAG_TOP_K: int = 4
+    RAG_MIN_SCORE: float = 0.35
+    RAG_MAX_CONTEXT_CHARS: int = 2500
 
     model_config = SettingsConfigDict(
-        env_file=".env", 
+        env_file=str(BASE_DIR / ".env"), 
         env_file_encoding='utf-8', 
         extra='ignore'
     )
