@@ -27,6 +27,7 @@ import {
   ARDOStartRequest,
   HistoryItem,
   BrowserEvidenceItem,
+  GoalVerificationResponse,
   KnowledgeStats,
 } from '@/lib/ardo-api';
 
@@ -51,6 +52,7 @@ interface ARDOState {
   mode: string;
   isSessionActive: boolean;
   wsStatus: 'idle' | 'connecting' | 'connected' | 'disconnected' | 'error';
+  planHash: string | null;
 
   // Graph
   nodeMap: Map<string, ARDONodeState>;
@@ -63,12 +65,14 @@ interface ARDOState {
   retryingTaskIds: Set<string>;
   blockedNodeIds: Set<string>;
   approvalPendingIds: Set<string>;
+  approvedTaskIds: Set<string>;
   // Phase 5: Safety metadata per task (from backend SafetyDecision)
   safetyMetadataMap: Map<string, Record<string, unknown>>;
   deniedTaskIds: Set<string>;
 
-  // Browser Evidence & History (Phase 11 & 12)
+  // Browser Evidence & History (Phase 11 & 12 & Phase 3)
   browserEvidence: BrowserEvidenceItem[];
+  goalVerification: GoalVerificationResponse | null;
   executionHistory: HistoryItem[];
   knowledgeStats: KnowledgeStats | null;
 
@@ -93,13 +97,14 @@ interface ARDOState {
 
   startSession: (request: ARDOStartRequest) => Promise<void>;
   applyEvent: (event: OrchestrationEvent) => void;
-  approveTask: (taskId: string) => Promise<void>;
+  approveTask: (taskId: string, planHash?: string, notes?: string) => Promise<void>;
   rejectTask: (taskId: string) => Promise<void>;
   resetOrchestration: () => void;
   refreshState: () => Promise<void>;
   refreshMetrics: () => Promise<void>;
   loadHistory: () => Promise<void>;
   loadEvidence: (sessionId?: string) => Promise<void>;
+  loadGoalVerification: (sessionId?: string) => Promise<void>;
   loadKnowledgeStats: () => Promise<void>;
 }
 
@@ -134,6 +139,7 @@ export const useARDOStore = create<ARDOState>((set, get) => ({
   mode: 'safe',
   isSessionActive: false,
   wsStatus: 'idle',
+  planHash: null,
 
   nodeMap: new Map(),
   executionQueue: [],
@@ -144,10 +150,12 @@ export const useARDOStore = create<ARDOState>((set, get) => ({
   retryingTaskIds: new Set(),
   blockedNodeIds: new Set(),
   approvalPendingIds: new Set<string>(),
+  approvedTaskIds: new Set<string>(),
   safetyMetadataMap: new Map<string, Record<string, unknown>>(),
   deniedTaskIds: new Set<string>(),
 
   browserEvidence: [],
+  goalVerification: null,
   executionHistory: [],
   knowledgeStats: null,
 
@@ -166,6 +174,12 @@ export const useARDOStore = create<ARDOState>((set, get) => ({
   // ── startSession ─────────────────────────────────────────────────────
 
   startSession: async (request) => {
+    const { isSessionActive, isLoading } = get();
+    if (isSessionActive || isLoading) {
+      console.warn('[RUN-GUARD] startSession rejected: session already active or loading');
+      return;
+    }
+    console.log('[RUN-GUARD] startSession called', request);
     set({ isLoading: true, error: null, wsStatus: 'connecting', currentGoal: request.goal, browserEvidence: [] });
     try {
       const response: ARDOSessionResponse = await ardoApi.startOrchestration(request);
@@ -180,6 +194,7 @@ export const useARDOStore = create<ARDOState>((set, get) => ({
         sessionId: response.session_id,
         mode: response.mode,
         isSessionActive: true,
+        planHash: response.plan_hash ?? null,
         nodeMap,
         executionQueue: response.initial_queue,
         parallelGroups: response.parallel_groups,
@@ -216,6 +231,8 @@ export const useARDOStore = create<ARDOState>((set, get) => ({
       const retryingTaskIds = new Set(state.retryingTaskIds);
       const blockedNodeIds = new Set(state.blockedNodeIds);
       const approvalPendingIds = new Set(state.approvalPendingIds);
+      const approvedTaskIds = new Set(state.approvedTaskIds);
+      const deniedTaskIds = new Set(state.deniedTaskIds);
       let whyNow = state.whyNow;
       let metrics = state.metrics ?? { ...DEFAULT_METRICS };
       const timelineMarkers = [...state.timelineMarkers];
@@ -242,9 +259,11 @@ export const useARDOStore = create<ARDOState>((set, get) => ({
             nodeMap.set(taskId!, { ...node, status: 'completed' });
           }
           if (activeTaskId === taskId) activeTaskId = null;
+          // Deterministic idempotent count from nodeMap
+          const completedCount = Array.from(nodeMap.values()).filter(n => n.status === 'completed').length;
           metrics = {
             ...metrics,
-            tasks_completed: (metrics.tasks_completed ?? 0) + 1,
+            tasks_completed: completedCount,
           };
           timelineMarkers.push({
             type: 'complete',
@@ -300,6 +319,8 @@ export const useARDOStore = create<ARDOState>((set, get) => ({
             nodeMap.set(taskId!, { ...node, status: 'blocked' });
           }
           blockedNodeIds.add(taskId ?? '');
+          approvalPendingIds.delete(taskId ?? '');
+          if (taskId) deniedTaskIds.add(taskId);
           metrics = {
             ...metrics,
             tasks_blocked: (metrics.tasks_blocked ?? 0) + 1,
@@ -328,9 +349,10 @@ export const useARDOStore = create<ARDOState>((set, get) => ({
 
         case 'task_approved':
           if (node) {
-            nodeMap.set(taskId!, { ...node, status: 'active' });
+            nodeMap.set(taskId!, { ...node, status: 'waiting' });
           }
           approvalPendingIds.delete(taskId ?? '');
+          if (taskId) approvedTaskIds.add(taskId);
           timelineMarkers.push({
             type: 'approve',
             task_id: taskId!,
@@ -386,6 +408,15 @@ export const useARDOStore = create<ARDOState>((set, get) => ({
           if (event.details) {
             metrics = { ...metrics, ...(event.details as Partial<SessionMetrics>) };
           }
+          // Cleanly close WebSocket once session completes
+          _wsClient?.disconnect();
+          setTimeout(() => {
+            const sid = get().sessionId;
+            if (sid) {
+              get().loadEvidence(sid);
+              get().loadGoalVerification(sid);
+            }
+          }, 50);
           break;
       }
 
@@ -396,6 +427,8 @@ export const useARDOStore = create<ARDOState>((set, get) => ({
         retryingTaskIds,
         blockedNodeIds,
         approvalPendingIds,
+        approvedTaskIds,
+        deniedTaskIds,
         whyNow,
         metrics,
         timelineMarkers: timelineMarkers.slice(-100),
@@ -410,12 +443,19 @@ export const useARDOStore = create<ARDOState>((set, get) => ({
 
   // ── approveTask ───────────────────────────────────────────────────────
 
-  approveTask: async (taskId) => {
+  approveTask: async (taskId, planHash, notes) => {
     const { sessionId } = get();
     if (!sessionId) return;
+    set((state) => {
+      const approved = new Set(state.approvedTaskIds);
+      approved.add(taskId);
+      const pending = new Set(state.approvalPendingIds);
+      pending.delete(taskId);
+      return { approvedTaskIds: approved, approvalPendingIds: pending };
+    });
     try {
-      await ardoApi.approveTask(sessionId, taskId, true);
-      // The WS will emit task_approved event which updates the store
+      const hashToSend = planHash ?? get().planHash ?? undefined;
+      await ardoApi.approveTask(sessionId, taskId, true, hashToSend, notes);
     } catch (err) {
       set({ error: String(err) });
     }
@@ -424,6 +464,13 @@ export const useARDOStore = create<ARDOState>((set, get) => ({
   rejectTask: async (taskId) => {
     const { sessionId } = get();
     if (!sessionId) return;
+    set((state) => {
+      const denied = new Set(state.deniedTaskIds);
+      denied.add(taskId);
+      const pending = new Set(state.approvalPendingIds);
+      pending.delete(taskId);
+      return { deniedTaskIds: denied, approvalPendingIds: pending };
+    });
     try {
       await ardoApi.approveTask(sessionId, taskId, false);
     } catch (err) {
@@ -451,6 +498,7 @@ export const useARDOStore = create<ARDOState>((set, get) => ({
         stabilityEvents: state.stability_events,
         weightSuggestion: state.weight_suggestion ?? null,
         metrics: state.metrics as SessionMetrics,
+        planHash: state.plan_hash ?? get().planHash,
       });
     } catch {
       // Silent fail — WS events keep state fresh
@@ -472,6 +520,7 @@ export const useARDOStore = create<ARDOState>((set, get) => ({
 
   loadHistory: async () => {
     try {
+      console.log('[RUN-GUARD] history/evidence refresh - loadHistory');
       const res = await ardoApi.getHistory();
       if (res && res.history) {
         set({ executionHistory: res.history });
@@ -485,9 +534,24 @@ export const useARDOStore = create<ARDOState>((set, get) => ({
     const sid = targetSessionId || get().sessionId;
     if (!sid) return;
     try {
+      console.log('[RUN-GUARD] history/evidence refresh - loadEvidence', sid);
       const res = await ardoApi.getEvidence(sid);
       if (res && res.evidence_items) {
         set({ browserEvidence: res.evidence_items });
+      }
+      get().loadGoalVerification(sid);
+    } catch {
+      // Graceful fallback
+    }
+  },
+
+  loadGoalVerification: async (targetSessionId) => {
+    const sid = targetSessionId || get().sessionId;
+    if (!sid) return;
+    try {
+      const res = await ardoApi.getGoalVerification(sid);
+      if (res) {
+        set({ goalVerification: res });
       }
     } catch {
       // Graceful fallback
@@ -524,9 +588,11 @@ export const useARDOStore = create<ARDOState>((set, get) => ({
       retryingTaskIds: new Set(),
       blockedNodeIds: new Set(),
       approvalPendingIds: new Set(),
+      approvedTaskIds: new Set(),
       safetyMetadataMap: new Map(),
       deniedTaskIds: new Set(),
       browserEvidence: [],
+      goalVerification: null,
       executionEvents: [],
       rescheduleLog: [],
       stabilityEvents: [],

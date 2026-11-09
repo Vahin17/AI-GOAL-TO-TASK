@@ -111,7 +111,7 @@ export default function WorkflowCanvas() {
   }), []);
 
   return (
-    <div className="relative h-full w-full bg-white overflow-hidden font-sans">
+    <div className="relative h-full w-full min-h-[400px] min-w-[300px] bg-white overflow-hidden font-sans">
       <ReactFlow
         nodes={nodes}
         edges={edges}
@@ -120,6 +120,7 @@ export default function WorkflowCanvas() {
         fitView
         minZoom={0.2}
         className="workflow-canvas"
+        style={{ width: '100%', height: '100%' }}
       >
         <Background 
           color="#30E3CA" // primary accent

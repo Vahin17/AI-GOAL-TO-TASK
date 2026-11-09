@@ -1,5 +1,6 @@
-import ThreePanelLayout from '@/components/layout/ThreePanelLayout';
+import LandingPage from '@/components/landing/LandingPage';
 
 export default function Home() {
-  return <ThreePanelLayout />;
+  return <LandingPage />;
 }
+

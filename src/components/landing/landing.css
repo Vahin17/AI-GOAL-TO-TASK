@@ -1,0 +1,92 @@
+/* Centralized Design Tokens & Styles for ARDO Landing Page */
+.landing-root {
+  --bg-main: #f0fdf4;
+  /* Soft light mint green tint */
+  --bg-card: #ffffff;
+  --bg-card-hover: #f8fafc;
+  --text-main: #0f172a;
+  --text-primary: #0f172a;
+  --text-secondary: #334155;
+  --text-muted: #475569;
+  --text-subtle: #64748b;
+  --border-color: #d1e5dc;
+  --accent-primary: #059669;
+  --accent-secondary: #0d9488;
+  --glass-bg: rgba(255, 255, 255, 0.90);
+  --terminal-bg: #090a0f;
+  --code-text: #0284c7;
+
+  background-color: var(--bg-main);
+  color: var(--text-main);
+  min-height: 100vh;
+  position: relative;
+  overflow-x: hidden;
+  transition: background-color 0.3s ease, color 0.3s ease;
+}
+
+.landing-root.dark,
+:is(html.dark) .landing-root {
+  --bg-main: #090d0b;
+  /* Deep charcoal with forest-green undertones */
+  --bg-card: #111c16;
+  --bg-card-hover: #16261e;
+  --text-main: #f1f5f9;
+  --text-primary: #f8fafc;
+  --text-secondary: #cbd5e1;
+  --text-muted: #94a3b8;
+  --text-subtle: #64748b;
+  --border-color: rgba(16, 185, 129, 0.25);
+  --accent-primary: #34d399;
+  --accent-secondary: #2dd4bf;
+  --glass-bg: rgba(17, 28, 22, 0.85);
+  --terminal-bg: #050806;
+  --code-text: #34d399;
+}
+
+.landing-root .code-font {
+  font-family: var(--font-jetbrains-mono), ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.landing-root .ardo-panel {
+  background-color: var(--bg-card);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--border-color);
+  box-shadow: 0 4px 20px -2px rgba(5, 150, 105, 0.08);
+  transition: background-color 0.3s ease, border-color 0.3s ease, box-shadow 0.3s ease, transform 0.2s ease;
+}
+
+.landing-root .ardo-panel:hover {
+  border-color: var(--accent-primary);
+  box-shadow: 0 0 25px rgba(5, 150, 105, 0.15);
+}
+
+.landing-root .gradient-text {
+  background: linear-gradient(135deg, #059669 0%, #0d9488 50%, #0284c7 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.landing-root.dark .gradient-text,
+:is(html.dark) .landing-root .gradient-text {
+  background: linear-gradient(135deg, #34d399 0%, #2dd4bf 50%, #38bdf8 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+/* Landing specific animations */
+@keyframes landingFloat {
+
+  0%,
+  100% {
+    transform: translateY(0px);
+  }
+
+  50% {
+    transform: translateY(-8px);
+  }
+}
+
+.landing-root .animate-float {
+  animation: landingFloat 6s ease-in-out infinite;
+}
