@@ -86,10 +86,10 @@ class SafetyAnalyzer:
             contexts = self._parse_batch_response(llm_result, tasks)
         except Exception as e:
             logger.warning(
-                f"[SafetyAnalyzer] Batch semantic analysis failed: {e}. "
-                "All tasks defaulting to UNKNOWN context."
+                f"[SafetyAnalyzer] Batch semantic analysis failed or LLM unavailable: {e}. "
+                "Engaging deterministic heuristic safety analysis."
             )
-            return {t["task_id"]: SafetyContext.unknown(t["task_id"]) for t in tasks}
+            return self._heuristic_fallback_analysis(goal, tasks)
 
         # Validate: every expected task must have a context
         for task in tasks:
@@ -109,14 +109,19 @@ class SafetyAnalyzer:
         """Invoke the configured LLM with the batch safety analysis prompt."""
         from core.config import settings
 
+        prompt = self._build_batch_prompt(goal, tasks)
+
+        if getattr(settings, "GEMINI_API_KEY", None):
+            from ai.gemini_provider import GeminiProvider
+            provider = GeminiProvider()
+            return await provider.query(prompt, json_mode=True)
+
         api_key = getattr(settings, "OPENAI_API_KEY", None)
         if not api_key:
             raise RuntimeError("LLM_UNAVAILABLE: No API key configured.")
 
         from langchain_openai import ChatOpenAI
         llm = ChatOpenAI(temperature=0.0, model="gpt-4o-mini", api_key=api_key)
-
-        prompt = self._build_batch_prompt(goal, tasks)
         response = await llm.ainvoke([{"role": "user", "content": prompt}])
         return response.content
 
@@ -226,5 +231,117 @@ Return ONLY the JSON object, no markdown wrapping."""
                     f"[SafetyAnalyzer] Validation failed for task={tid}: {e}. Using UNKNOWN."
                 )
                 contexts[tid] = SafetyContext.unknown(tid)
+ 
+        return contexts
+
+    def _heuristic_fallback_analysis(
+        self, goal: str, tasks: List[Dict]
+    ) -> Dict[str, SafetyContext]:
+        """
+        Deterministic, rule-based semantic safety analyzer used when external LLM is unconfigured.
+        Categorizes actions safely based on deterministic keyword and semantic rules.
+        """
+        contexts: Dict[str, SafetyContext] = {}
+        for task in tasks:
+            tid = task["task_id"]
+            name = task.get("task_name", task.get("label", "")).lower()
+
+            # 1. Critical / Block signals
+            if any(k in name for k in ("rm -rf", "format c:", "delete all", "drop database", "wipe disk", "boot", "kernel", "system32", "etc/passwd", "etc/shadow")):
+                contexts[tid] = SafetyContext(
+                    task_id=tid,
+                    action=ActionType.DELETE,
+                    target="System critical resources",
+                    target_category=TargetCategory.OS_SYSTEM_FILE,
+                    scope=Scope.SYSTEM,
+                    environment=Environment.LOCAL,
+                    reversibility=Reversibility.NONE,
+                    destructive_potential=DestructivePotential.CRITICAL,
+                    privilege_required=True,
+                    system_critical=True,
+                    ambiguity=AmbiguityLevel.CLEAR,
+                    semantic_confidence=0.95,
+                )
+                continue
+
+            # 2. Credential modifications
+            if any(k in name for k in ("token", "password", "secret", "private key", "auth key", "credential")):
+                contexts[tid] = SafetyContext(
+                    task_id=tid,
+                    action=ActionType.MODIFY,
+                    target="Security credentials",
+                    target_category=TargetCategory.CREDENTIAL,
+                    scope=Scope.APPLICATION,
+                    environment=Environment.LOCAL,
+                    reversibility=Reversibility.LOW,
+                    destructive_potential=DestructivePotential.HIGH,
+                    data_sensitivity=DataSensitivity.CREDENTIAL,
+                    ambiguity=AmbiguityLevel.CLEAR,
+                    semantic_confidence=0.95,
+                )
+                continue
+
+            # 3. Read-only browser navigation, inspection, search, screenshot
+            if any(k in name for k in ("navigate", "open", "dashboard", "search", "click", "find", "screenshot", "extract", "view", "inspect")):
+                is_screenshot = "screenshot" in name
+                contexts[tid] = SafetyContext(
+                    task_id=tid,
+                    action=ActionType.NAVIGATE if any(k in name for k in ("navigate", "open dashboard", "go to")) else ActionType.READ,
+                    target="Browser interface / dashboard fixture",
+                    target_category=TargetCategory.TEMP_ARTIFACT if is_screenshot else TargetCategory.BROWSER_DATA,
+                    scope=Scope.APPLICATION,
+                    environment=Environment.LOCAL,
+                    reversibility=Reversibility.HIGH,
+                    destructive_potential=DestructivePotential.NONE,
+                    privilege_required=False,
+                    system_critical=False,
+                    data_sensitivity=DataSensitivity.NONE,
+                    external_side_effect=False,
+                    ambiguity=AmbiguityLevel.CLEAR,
+                    semantic_confidence=0.95,
+                )
+                continue
+
+            # 4. In-page data updates (e.g. update description, fill form, type note)
+            if any(k in name for k in ("update", "edit", "fill", "type", "set", "write", "change")):
+                contexts[tid] = SafetyContext(
+                    task_id=tid,
+                    action=ActionType.MODIFY,
+                    target="Application data / project metadata",
+                    target_category=TargetCategory.APPLICATION_DATA,
+                    scope=Scope.APPLICATION,
+                    environment=Environment.LOCAL,
+                    reversibility=Reversibility.HIGH,
+                    destructive_potential=DestructivePotential.NONE,
+                    privilege_required=False,
+                    system_critical=False,
+                    data_sensitivity=DataSensitivity.NONE,
+                    external_side_effect=False,
+                    ambiguity=AmbiguityLevel.CLEAR,
+                    semantic_confidence=0.90,
+                )
+                continue
+
+            # 5. Generic safe task or default unknown
+            if any(k in name for k in ("initialization", "execution", "verification", "process", "run")):
+                contexts[tid] = SafetyContext(
+                    task_id=tid,
+                    action=ActionType.EXECUTE,
+                    target="Standard application workflow",
+                    target_category=TargetCategory.APPLICATION_DATA,
+                    scope=Scope.APPLICATION,
+                    environment=Environment.LOCAL,
+                    reversibility=Reversibility.HIGH,
+                    destructive_potential=DestructivePotential.NONE,
+                    privilege_required=False,
+                    system_critical=False,
+                    data_sensitivity=DataSensitivity.NONE,
+                    external_side_effect=False,
+                    ambiguity=AmbiguityLevel.CLEAR,
+                    semantic_confidence=0.85,
+                )
+                continue
+
+            contexts[tid] = SafetyContext.unknown(tid)
 
         return contexts

@@ -113,7 +113,7 @@ class SessionMetrics:
 
     @property
     def success_rate(self) -> float:
-        total = self.tasks_completed + self.tasks_failed
+        total = self.tasks_total if self.tasks_total > 0 else (self.tasks_completed + self.tasks_failed)
         if total == 0:
             return 0.0
         return round(self.tasks_completed / total, 3)
@@ -157,6 +157,26 @@ class SessionMetrics:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+def redact_sensitive_details(details: Dict[str, Any]) -> Dict[str, Any]:
+    """Redacts passwords, tokens, API keys, secrets, and auth credentials from event details."""
+    if not isinstance(details, dict):
+        return details
+    redacted = {}
+    SENSITIVE_KEYS = {"password", "passwd", "secret", "token", "key", "credential", "auth", "authorization", "cookie"}
+    for k, v in details.items():
+        k_str = str(k).lower()
+        if any(s in k_str for s in SENSITIVE_KEYS) and isinstance(v, str):
+            redacted[k] = "[REDACTED]"
+        elif isinstance(v, dict):
+            redacted[k] = redact_sensitive_details(v)
+        elif isinstance(v, list):
+            redacted[k] = [redact_sensitive_details(item) if isinstance(item, dict) else item for item in v]
+        else:
+            redacted[k] = v
+    return redacted
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Execution Monitor
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -185,6 +205,8 @@ class ExecutionMonitor:
 
     def emit(self, event: OrchestrationEvent) -> OrchestrationEvent:
         """Record and optionally persist an event. Returns the event."""
+        if event.details:
+            event.details = redact_sensitive_details(event.details)
         self._event_log.append(event)
         self._update_metrics_from_event(event)
         logger.info(
@@ -301,14 +323,132 @@ class ExecutionMonitor:
             details={"reason": reason, "new_queue_preview": new_queue[:5]},
         ))
 
+    def on_observation_received(
+        self, task_id: str, task_name: str, observation_summary: Dict[str, Any]
+    ) -> OrchestrationEvent:
+        return self.emit(OrchestrationEvent(
+            event_type="observation_received",
+            session_id=self.session_id,
+            task_id=task_id,
+            task_name=task_name,
+            status="observing",
+            details=observation_summary,
+        ))
+
+    def on_decision_made(
+        self, task_id: str, task_name: str, decision_data: Dict[str, Any]
+    ) -> OrchestrationEvent:
+        return self.emit(OrchestrationEvent(
+            event_type="decision_made",
+            session_id=self.session_id,
+            task_id=task_id,
+            task_name=task_name,
+            status="decided",
+            details=decision_data,
+        ))
+
+    def on_action_started(
+        self, task_id: str, task_name: str, action_data: Dict[str, Any]
+    ) -> OrchestrationEvent:
+        return self.emit(OrchestrationEvent(
+            event_type="action_started",
+            session_id=self.session_id,
+            task_id=task_id,
+            task_name=task_name,
+            status="acting",
+            details=action_data,
+        ))
+
+    def on_action_completed(
+        self, task_id: str, task_name: str, action_data: Dict[str, Any]
+    ) -> OrchestrationEvent:
+        return self.emit(OrchestrationEvent(
+            event_type="action_completed",
+            session_id=self.session_id,
+            task_id=task_id,
+            task_name=task_name,
+            status="action_completed",
+            details=action_data,
+        ))
+
+    def on_action_failed(
+        self, task_id: str, task_name: str, action_data: Dict[str, Any], reason: str
+    ) -> OrchestrationEvent:
+        details = dict(action_data)
+        details["error"] = reason
+        return self.emit(OrchestrationEvent(
+            event_type="action_failed",
+            session_id=self.session_id,
+            task_id=task_id,
+            task_name=task_name,
+            status="action_failed",
+            details=details,
+        ))
+
+    def on_verification_started(
+        self, task_id: str, task_name: str, details: Optional[Dict[str, Any]] = None
+    ) -> OrchestrationEvent:
+        return self.emit(OrchestrationEvent(
+            event_type="verification_started",
+            session_id=self.session_id,
+            task_id=task_id,
+            task_name=task_name,
+            status="verifying",
+            details=details or {},
+        ))
+
+    def on_verification_completed(
+        self, task_id: str, task_name: str, status: str, details: Dict[str, Any]
+    ) -> OrchestrationEvent:
+        details_with_status = dict(details)
+        details_with_status["status"] = status
+        return self.emit(OrchestrationEvent(
+            event_type="verification_completed",
+            session_id=self.session_id,
+            task_id=task_id,
+            task_name=task_name,
+            status=status.lower(),
+            details=details_with_status,
+        ))
+
+    def on_recovery_started(
+        self, task_id: str, task_name: str, reason: str, attempt: int = 1, max_budget: int = 3
+    ) -> OrchestrationEvent:
+        return self.emit(OrchestrationEvent(
+            event_type="recovery_started",
+            session_id=self.session_id,
+            task_id=task_id,
+            task_name=task_name,
+            status="recovering",
+            details={"reason": reason, "attempt": attempt, "max_budget": max_budget},
+        ))
+
+    def on_recovery_exhausted(
+        self, task_id: str, task_name: str, reason: str
+    ) -> OrchestrationEvent:
+        return self.emit(OrchestrationEvent(
+            event_type="recovery_exhausted",
+            session_id=self.session_id,
+            task_id=task_id,
+            task_name=task_name,
+            status="recovery_exhausted",
+            details={"reason": reason},
+        ))
+
     def on_session_complete(self) -> OrchestrationEvent:
         self.metrics.completed_at = time.time_ns() / 1e9
+        is_all_success = (
+            self.metrics.tasks_total > 0
+            and self.metrics.tasks_completed == self.metrics.tasks_total
+            and self.metrics.tasks_failed == 0
+        )
+        status_str = "completed" if is_all_success else "failed"
         return self.emit(OrchestrationEvent(
             event_type="session_complete",
             session_id=self.session_id,
             task_id=None,
             task_name=None,
-            status="completed",
+            status=status_str,
             details=self.metrics.to_dict(),
         ))
 
@@ -316,7 +456,7 @@ class ExecutionMonitor:
 
     async def persist_event(self, event: OrchestrationEvent) -> None:
         """Persist a single event to orchestration_logs collection."""
-        if not self.db:
+        if self.db is None:
             return
         try:
             await self.db.orchestration_logs.insert_one(event.to_dict())
@@ -326,7 +466,7 @@ class ExecutionMonitor:
 
     async def persist_metrics_snapshot(self) -> None:
         """Upsert current session metrics to execution_metrics collection."""
-        if not self.db:
+        if self.db is None:
             return
         try:
             await self.db.execution_metrics.update_one(
@@ -339,7 +479,7 @@ class ExecutionMonitor:
 
     async def persist_runtime_state(self, graph: "ARDOGraph") -> None:
         """Snapshot current graph state to task_runtime_state collection."""
-        if not self.db:
+        if self.db is None:
             return
         try:
             await self.db.task_runtime_state.update_one(
@@ -356,7 +496,7 @@ class ExecutionMonitor:
 
     async def persist_scheduler_snapshot(self, trigger: str, snapshot_data: dict) -> None:
         """Persist scheduler reasoning snapshots at major orchestration transitions."""
-        if not self.db:
+        if self.db is None:
             return
         try:
             doc = {
@@ -371,7 +511,7 @@ class ExecutionMonitor:
             
     async def persist_replay_session(self, graph: "ARDOGraph", mode: str) -> None:
         """Initialize a replay session root record."""
-        if not self.db:
+        if self.db is None:
             return
         try:
             doc = {

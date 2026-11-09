@@ -79,12 +79,45 @@ class ARDOTaskNode:
     browser_action: Optional[Any] = None
     browser_result: Optional[Any] = None
 
+    # Phase 14: Tool Registry & Action Synthesis
+    tool_call: Optional[Any] = None
+    tool_result: Optional[Any] = None
+
+    # Original React Flow / Planner type
+    raw_type: str = "default"
+
+    # Task and contract metadata
+    metadata: Dict = field(default_factory=dict)
+
     def to_dict(self) -> dict:
+        def _ser(val: Any) -> Any:
+            if val is None:
+                return None
+            if hasattr(val, "to_dict") and callable(val.to_dict):
+                return val.to_dict()
+            if hasattr(val, "model_dump") and callable(val.model_dump):
+                try:
+                    return val.model_dump(mode="json")
+                except Exception:
+                    pass
+            if hasattr(val, "dict") and callable(val.dict):
+                try:
+                    return val.dict()
+                except Exception:
+                    pass
+            if isinstance(val, (str, int, float, bool)):
+                return val
+            if isinstance(val, (list, tuple, set)):
+                return [_ser(x) for x in val]
+            if isinstance(val, dict):
+                return {str(k): _ser(v) for k, v in val.items()}
+            return str(val)
+
         return {
             "task_id": self.task_id,
             "task_name": self.task_name,
             "dependency_ids": self.dependency_ids,
-            "status": self.status.value,
+            "status": self.status.value if hasattr(self.status, "value") else str(self.status),
             "priority_score": self.priority_score,
             "risk_score": self.risk_score,
             "retry_count": self.retry_count,
@@ -101,9 +134,12 @@ class ARDOTaskNode:
             "completed_at": self.completed_at,
             "execution_logs": self.execution_logs,
             "starvation_counter": self.starvation_counter,
-            "safety_metadata": self.safety_metadata,
-            "browser_action": self.browser_action.to_dict() if hasattr(self.browser_action, "to_dict") else self.browser_action,
-            "browser_result": self.browser_result.to_dict() if hasattr(self.browser_result, "to_dict") else self.browser_result,
+            "safety_metadata": _ser(self.safety_metadata),
+            "browser_action": _ser(self.browser_action),
+            "browser_result": _ser(self.browser_result),
+            "tool_call": _ser(self.tool_call),
+            "tool_result": _ser(self.tool_result),
+            "metadata": _ser(self.metadata),
         }
 
 
@@ -128,6 +164,10 @@ class ARDOGraph:
     reverse_adj: Dict[str, List[str]] = field(default_factory=dict)
     parallel_groups: List[List[str]] = field(default_factory=list)
     session_id: str = field(default_factory=lambda: f"ardo_{uuid.uuid4().hex[:10]}")
+    plan_hash: Optional[str] = field(default=None)
+    raw_nodes: List[Dict[str, Any]] = field(default_factory=list)
+    raw_edges: List[Dict[str, Any]] = field(default_factory=list)
+    goal_text: Optional[str] = field(default=None)
 
     def get_node(self, task_id: str) -> Optional[ARDOTaskNode]:
         return self.nodes.get(task_id)
@@ -144,6 +184,20 @@ class ARDOGraph:
     def snapshot(self) -> List[dict]:
         """Serialise all nodes for MongoDB persistence / API response."""
         return [n.to_dict() for n in self.nodes.values()]
+
+    def recompute_plan_hash(self, goal_text: Optional[str] = None) -> str:
+        """
+        Recomputes canonical SHA-256 plan hash directly from the current graph structure.
+        Any modification to node task_names, tools, or dependencies strictly produces a different hash.
+        """
+        from orchestration.plan_hasher import compute_plan_hash
+        goal = goal_text or self.goal_text or ""
+        reconstructed_edges = [
+            {"source": src, "target": tgt}
+            for src, targets in self.adjacency.items()
+            for tgt in targets
+        ]
+        return compute_plan_hash(list(self.nodes.values()), reconstructed_edges, intent=goal)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -170,6 +224,8 @@ class DAGBuilder:
         execution_mode: str = "safe",
         risk_threshold: float = 0.7,
         safety_decisions: Optional[Dict[str, "SafetyDecision"]] = None,
+        goal_text: str = "",
+        context: Optional[Dict] = None,
     ) -> ARDOGraph:
         """
         Build and validate an ARDOGraph.
@@ -183,6 +239,8 @@ class DAGBuilder:
                               When provided, replaces keyword-based heuristic risk scoring.
                               BLOCKED tasks (CRITICAL) start in TaskState.BLOCKED state.
                               REQUIRE_APPROVAL tasks have approval_needed=True.
+            goal_text:        Optional user goal string for action synthesis.
+            context:          Optional execution context (e.g. URLs, selectors) for synthesis.
 
         Returns:
             Validated ARDOGraph.
@@ -231,6 +289,21 @@ class DAGBuilder:
                 start_blocked = False
                 safety_meta = {}
 
+            # Extract task metadata
+            node_data = raw.get("data", {})
+            metadata = {}
+            if isinstance(node_data, dict):
+                if "metadata" in node_data and isinstance(node_data["metadata"], dict):
+                    metadata.update(node_data["metadata"])
+                for k, v in node_data.items():
+                    if k not in ("label", "metadata"):
+                        metadata[k] = v
+            if "metadata" in raw and isinstance(raw["metadata"], dict):
+                metadata.update(raw["metadata"])
+            for k in ("destination_url", "url", "expected_url", "success_criteria", "constraints", "action_type"):
+                if k in raw and k not in metadata:
+                    metadata[k] = raw[k]
+
             ardo_node = ARDOTaskNode(
                 task_id=node_id,
                 task_name=label,
@@ -239,13 +312,32 @@ class DAGBuilder:
                 approval_needed=approval_needed,
                 fallback_available=True,
                 safety_metadata=safety_meta,
+                metadata=metadata,
+                raw_type=str(raw.get("type", "default")),
             )
+
+            # Preserve pre-attached actions (e.g. from existing Phase 10 & 11 tests)
+            if "browser_action" in raw and raw["browser_action"] is not None:
+                if isinstance(raw["browser_action"], dict):
+                    try:
+                        from execution.browser.browser_models import BrowserAction
+                        ardo_node.browser_action = BrowserAction(**raw["browser_action"])
+                    except Exception:
+                        ardo_node.browser_action = raw["browser_action"]
+                else:
+                    ardo_node.browser_action = raw["browser_action"]
+            if "tool_call" in raw and raw["tool_call"] is not None:
+                ardo_node.tool_call = raw["tool_call"]
+            elif ardo_node.tool_call is None and isinstance(raw.get("data"), dict) and "tool_call" in raw["data"]:
+                ardo_node.tool_call = raw["data"]["tool_call"]
+
             if start_blocked:
                 from orchestration.state_machine import TaskState as _TS
                 ardo_node.status = _TS.BLOCKED
-                ardo_node.execution_logs.append(
-                    f"[SafetyEngine] Task BLOCKED by policy: {safety_meta.get('explanation', 'Critical risk')}"
-                )
+                if not ardo_node.execution_logs:
+                    ardo_node.execution_logs.append(
+                        f"[SafetyEngine] Task BLOCKED by policy: {safety_meta.get('explanation', 'Critical risk')}"
+                    )
             graph.nodes[node_id] = ardo_node
             graph.adjacency[node_id] = []
             graph.reverse_adj[node_id] = []
@@ -279,10 +371,16 @@ class DAGBuilder:
                     if len(group) > 1:
                         graph.nodes[task_id].execution_type = "parallel"
 
+        from orchestration.plan_hasher import compute_plan_hash
+        graph.plan_hash = compute_plan_hash(nodes_data, edges_data, intent=goal_text)
+        graph.raw_nodes = nodes_data
+        graph.raw_edges = edges_data
+        graph.goal_text = goal_text
+
         logger.info(
             f"[DAGBuilder] Graph built: {len(graph.nodes)} nodes, "
             f"{sum(len(v) for v in graph.adjacency.values())} edges, "
-            f"{len(graph.parallel_groups)} parallel groups."
+            f"{len(graph.parallel_groups)} parallel groups, plan_hash={graph.plan_hash[:12]}..."
         )
         return graph
 

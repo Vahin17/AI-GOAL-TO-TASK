@@ -39,6 +39,7 @@ class TaskState(str, Enum):
     FAILED           = "failed"
     BLOCKED          = "blocked"
     APPROVAL_NEEDED  = "approval_needed"
+    OUTCOME_UNKNOWN  = "outcome_unknown"
 
 
 # Adjacency map: state → set of valid target states
@@ -56,16 +57,27 @@ _VALID_TRANSITIONS: Dict[TaskState, Set[TaskState]] = {
         TaskState.FAILED,
         TaskState.RETRYING,
         TaskState.APPROVAL_NEEDED,
+        TaskState.OUTCOME_UNKNOWN,
     },
     TaskState.RETRYING: {
         TaskState.ACTIVE,
         TaskState.FAILED,
+        TaskState.OUTCOME_UNKNOWN,
     },
     TaskState.FAILED: {
         TaskState.BLOCKED,
     },
     TaskState.APPROVAL_NEEDED: {
+        TaskState.WAITING,
         TaskState.ACTIVE,
+        TaskState.BLOCKED,
+        TaskState.COMPLETED,
+    },
+    TaskState.OUTCOME_UNKNOWN: {
+        TaskState.COMPLETED,
+        TaskState.WAITING,
+        TaskState.APPROVAL_NEEDED,
+        TaskState.FAILED,
         TaskState.BLOCKED,
     },
     # Terminal states — no outgoing transitions

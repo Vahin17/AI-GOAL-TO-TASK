@@ -116,7 +116,7 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         self.model = model
         self._dimension = 1536
         from openai import OpenAI
-        self.client = OpenAI(api_key=api_key)
+        self.client = OpenAI(api_key=api_key, max_retries=0, timeout=3.0)
 
     @property
     def dimension(self) -> int:
@@ -142,36 +142,79 @@ class HybridEmbeddingService:
     on API failures or missing keys without crashing the application.
     """
 
+    _openai_quota_exhausted: bool = False
+    _last_embedding_error: Optional[str] = None
+    _last_fallback_reason: Optional[str] = None
+    _fallback_count: int = 0
+
     def __init__(self, api_key: Optional[str] = None, force_local: bool = False):
         self._local = DeterministicLocalEmbeddingProvider(dim=128)
         self._openai: Optional[OpenAIEmbeddingProvider] = None
-        
-        if api_key and not force_local:
+
+        if api_key and not force_local and not HybridEmbeddingService._openai_quota_exhausted:
             try:
                 self._openai = OpenAIEmbeddingProvider(api_key=api_key)
-                logger.info("[EmbeddingService] Initialized OpenAI embeddings (text-embedding-3-small)")
+                logger.info("[EMBEDDING-CONFIG] provider=openai")
             except Exception as e:
+                HybridEmbeddingService._last_embedding_error = str(e)
+                HybridEmbeddingService._last_fallback_reason = "init_failure"
                 logger.warning(f"[EmbeddingService] Failed to init OpenAI embeddings: {e}. Using deterministic local.")
+                logger.info("[EMBEDDING-CONFIG] provider=local")
         else:
-            logger.info("[EmbeddingService] Using deterministic local embeddings.")
+            if HybridEmbeddingService._openai_quota_exhausted:
+                logger.info("[EMBEDDING-CONFIG] provider=local (cached quota_exhausted)")
+            else:
+                logger.info("[EMBEDDING-CONFIG] provider=local")
 
     def embed_texts(self, texts: List[str]) -> List[List[float]]:
-        if self._openai:
+        if self._openai and not HybridEmbeddingService._openai_quota_exhausted:
             try:
                 return self._openai.embed_texts(texts)
             except Exception as e:
-                logger.warning(f"[EmbeddingService] OpenAI embed failed: {e}. Falling back to local.")
+                err_str = str(e).lower()
+                HybridEmbeddingService._last_embedding_error = str(e)
+                HybridEmbeddingService._fallback_count += 1
+                if "quota" in err_str or "credit" in err_str or "429" in err_str:
+                    HybridEmbeddingService._openai_quota_exhausted = True
+                    HybridEmbeddingService._last_fallback_reason = "quota_exhausted_429"
+                    logger.warning(f"[EMBEDDING-FALLBACK] reason=quota_exhausted: {e}")
+                else:
+                    HybridEmbeddingService._last_fallback_reason = "api_error"
+                    logger.warning(f"[EmbeddingService] OpenAI embed failed: {e}. Falling back to local.")
                 self._openai = None
+                logger.info("[EMBEDDING-CONFIG] provider=local")
         return self._local.embed_texts(texts)
 
     def embed_query(self, query: str) -> List[float]:
-        if self._openai:
+        if self._openai and not HybridEmbeddingService._openai_quota_exhausted:
             try:
                 return self._openai.embed_query(query)
             except Exception as e:
-                logger.warning(f"[EmbeddingService] OpenAI embed_query failed: {e}. Falling back to local.")
+                err_str = str(e).lower()
+                HybridEmbeddingService._last_embedding_error = str(e)
+                HybridEmbeddingService._fallback_count += 1
+                if "quota" in err_str or "credit" in err_str or "429" in err_str:
+                    HybridEmbeddingService._openai_quota_exhausted = True
+                    HybridEmbeddingService._last_fallback_reason = "quota_exhausted_429"
+                    logger.warning(f"[EMBEDDING-FALLBACK] reason=quota_exhausted: {e}")
+                else:
+                    HybridEmbeddingService._last_fallback_reason = "api_error"
+                    logger.warning(f"[EmbeddingService] OpenAI embed_query failed: {e}. Falling back to local.")
                 self._openai = None
+                logger.info("[EMBEDDING-CONFIG] provider=local")
         return self._local.embed_query(query)
+
+    @classmethod
+    def get_diagnostics(cls) -> Dict[str, Any]:
+        from core.config import settings
+        has_key = bool(getattr(settings, "OPENAI_API_KEY", None))
+        return {
+            "openai_quota_exhausted": cls._openai_quota_exhausted,
+            "last_embedding_error": cls._last_embedding_error,
+            "last_fallback_reason": cls._last_fallback_reason,
+            "fallback_count": cls._fallback_count,
+            "embedding_fallback_active": cls._openai_quota_exhausted or (not has_key),
+        }
 
     @property
     def active_dimension(self) -> int:

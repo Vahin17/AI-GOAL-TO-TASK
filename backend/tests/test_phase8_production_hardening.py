@@ -16,8 +16,8 @@ Comprehensive deterministic validation covering:
 import asyncio
 import time
 from typing import Any, Dict, List
-import numpy as np
 import pytest
+np = pytest.importorskip("numpy")
 
 from core.config import settings
 from knowledge.chunking import TextChunker

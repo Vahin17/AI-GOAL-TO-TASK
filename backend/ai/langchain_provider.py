@@ -1,3 +1,4 @@
+from typing import Optional
 from ai.base_provider import LLMProvider
 from schemas.models import PlanGraphResponse
 from core.config import settings
@@ -34,7 +35,12 @@ class LangChainProvider(LLMProvider):
             ("human", "Goal to decompose: {goal}"),
         ])
 
-    async def generate_plan(self, goal: str, rag_context: str = "") -> PlanGraphResponse:
+    async def generate_plan(
+        self,
+        goal: str,
+        rag_context: str = "",
+        critic_feedback: Optional[str] = None,
+    ) -> PlanGraphResponse:
         """
         Executes the LangChain chain, resolving validation rules automatically via OutputParser.
         """

@@ -1,15 +1,9 @@
 import type { Metadata } from "next";
-import { Inter } from "next/font/google";
 import "./globals.css";
 
-const inter = Inter({
-  variable: "--font-inter",
-  subsets: ["latin"],
-});
-
 export const metadata: Metadata = {
-  title: "AI Goal-To-Task Planning Engine",
-  description: "Clean, modern SaaS dashboard for AI operations.",
+  title: "ARDO — Autonomous Resilient Directed Orchestrator",
+  description: "AI Goal-to-Task Planning Engine with Context-Aware RAG, Semantic Memory, and Safety-Aware Execution.",
 };
 
 export default function RootLayout({
@@ -20,7 +14,7 @@ export default function RootLayout({
   return (
     <html
       lang="en"
-      className={`${inter.variable} h-full antialiased`}
+      className="min-h-full antialiased"
     >
       <body className="min-h-full flex flex-col font-sans mb-0">
         {children}

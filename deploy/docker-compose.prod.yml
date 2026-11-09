@@ -1,0 +1,132 @@
+version: '3.8'
+
+services:
+  # ───────────────────────────────────────────────────────────────────────────
+  # 1. Authoritative PostgreSQL with pgvector extension
+  # ───────────────────────────────────────────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: ardo-postgres
+    restart: always
+    environment:
+      POSTGRES_DB: ai_goal_planner
+      POSTGRES_USER: ${POSTGRES_USER:-ardo_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env.production}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - internal_backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ardo_admin} -d ai_goal_planner"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 2. Document & User Profile Store (MongoDB)
+  # ───────────────────────────────────────────────────────────────────────────
+  mongodb:
+    image: mongo:7.0
+    container_name: ardo-mongodb
+    restart: always
+    environment:
+      MONGO_INITDB_DATABASE: ai_goal_planner
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - internal_backend
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 3. Controlled Egress Proxy for Browser Automation (Squid)
+  # ───────────────────────────────────────────────────────────────────────────
+  squid-egress:
+    image: ubuntu/squid:latest
+    container_name: ardo-squid-egress
+    restart: always
+    volumes:
+      - ./squid/squid.conf:/etc/squid/squid.conf:ro
+    networks:
+      - browser_egress
+      - public_internet
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 4. ARDO FastAPI Backend
+  # ───────────────────────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    container_name: ardo-backend
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+      squid-egress:
+        condition: service_started
+    environment:
+      ENVIRONMENT: production
+      DEBUG: "false"
+      LOG_LEVEL: INFO
+      STRUCTURED_LOGGING: "true"
+      POSTGRES_URI: postgresql://${POSTGRES_USER:-ardo_admin}:${POSTGRES_PASSWORD}@postgres:5432/ai_goal_planner
+      MONGODB_URI: mongodb://mongodb:27017/ai_goal_planner
+      AUTH_DB_BACKEND: postgres
+      COOKIE_SECURE: "true"
+      COOKIE_SAMESITE: lax
+      SESSION_COOKIE_NAME: ardo_session
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?Set ALLOWED_ORIGINS in .env.production}
+      CSRF_TRUSTED_ORIGINS: ${ALLOWED_ORIGINS}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:?Set GEMINI_API_KEY in .env.production}
+      HEADLESS_BROWSER: "true"
+      BROWSER_EGRESS_PROXY: http://squid-egress:3128
+    networks:
+      - internal_backend
+      - browser_egress
+      - frontend_backend
+    ports:
+      - "127.0.0.1:8000:8000"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 5. ARDO Next.js Frontend
+  # ───────────────────────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.frontend
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-https://ardo.example.com}
+    container_name: ardo-frontend
+    restart: always
+    depends_on:
+      - backend
+    environment:
+      NODE_ENV: production
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-https://ardo.example.com}
+    networks:
+      - frontend_backend
+    ports:
+      - "127.0.0.1:3000:3000"
+
+volumes:
+  postgres_data:
+  mongo_data:
+
+networks:
+  # Internal network for database communication (NO internet access)
+  internal_backend:
+    internal: true
+  # Egress network routing browser traffic exclusively through Squid
+  browser_egress:
+    internal: false
+  # Network for frontend-to-backend communication
+  frontend_backend:
+  # Public Internet for outbound web automation via proxy
+  public_internet:
+

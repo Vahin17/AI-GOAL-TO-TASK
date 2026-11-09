@@ -87,6 +87,7 @@ class ARDOSessionResponse(BaseModel):
     parallel_groups: List[List[str]]
     initial_queue: List[str]
     initial_graph: List[ARDONodeStateResponse]
+    plan_hash: Optional[str] = Field(default=None, description="Canonical SHA-256 hash of the plan DAG.")
 
 
 class ARDOStateResponse(BaseModel):
@@ -101,7 +102,16 @@ class ARDOStateResponse(BaseModel):
     reschedule_log: List[Dict[str, Any]]
     stability_events: List[Dict[str, Any]]
     weight_suggestion: Optional[Dict[str, Any]] = None
+    plan_hash: Optional[str] = Field(default=None, description="Canonical SHA-256 hash of the current plan DAG.")
 
 
 class ApproveTaskRequest(BaseModel):
     approved: bool = Field(default=True)
+    plan_hash: Optional[str] = Field(
+        default=None,
+        description="Canonical SHA-256 plan hash to cryptographically verify before approval."
+    )
+    notes: Optional[str] = Field(
+        default=None,
+        description="Optional operator notes or confirmation rationale."
+    )

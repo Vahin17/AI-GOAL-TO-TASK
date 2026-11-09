@@ -49,6 +49,24 @@ class BrowserTaskAdapter:
         self.safety_engine = safety_engine or SafetyEngine()
         self.safety_policy_engine = safety_policy_engine or SafetyPolicyEngine()
 
+    async def ensure_started(self) -> None:
+        """Ensure the underlying Playwright browser executor has launched and initialized a page."""
+        if self.executor is not None and not getattr(self.executor, "is_running", False):
+            if hasattr(self.executor, "start"):
+                await self.executor.start()
+
+    def get_page(self) -> Any:
+        """Return the active Playwright page instance from the executor."""
+        if self.executor is None:
+            return None
+        return getattr(self.executor, "_page", None)
+
+    def get_context(self) -> Any:
+        """Return the active Playwright browser context instance from the executor."""
+        if self.executor is None:
+            return None
+        return getattr(self.executor, "_context", None)
+
     @staticmethod
     def infer_safety_context(task_id: str, action: BrowserAction) -> SafetyContext:
         """
@@ -65,7 +83,13 @@ class BrowserTaskAdapter:
                 external_side_effect=is_external,
             )
 
-        elif action.action_type in (BrowserActionType.EXTRACT_TEXT, BrowserActionType.GET_TITLE, BrowserActionType.GET_URL):
+        elif action.action_type in (
+            BrowserActionType.EXTRACT_TEXT,
+            BrowserActionType.GET_TITLE,
+            BrowserActionType.GET_URL,
+            BrowserActionType.SCREENSHOT,
+            BrowserActionType.INSPECT_PAGE,
+        ):
             return SafetyContext(
                 task_id=task_id,
                 action=ActionType.READ,
@@ -155,5 +179,10 @@ class BrowserTaskAdapter:
                 )
 
         # 3. Executable
+        logger.info(f"[ACTION-EXEC] BrowserTaskAdapter called for task_id={task_id} action={action.action_type.value}")
+        logger.info(
+            f"[BROWSER-EXEC] BrowserTaskAdapter action={action.action_type.value} "
+            f"selector={action.selector} url={action.url}"
+        )
         result = await self.executor.execute_action(action)
         return result, decision

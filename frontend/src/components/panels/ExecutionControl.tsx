@@ -25,7 +25,8 @@ import {
   ExternalLink,
   Eye,
   X,
-  Maximize2
+  Maximize2,
+  Lock
 } from 'lucide-react';
 import { useAppStore } from '@/store/useAppStore';
 import { useARDOStore } from '@/store/useARDOStore';
@@ -43,12 +44,15 @@ export default function ExecutionControl() {
     whyNow, 
     executionEvents, 
     approvalPendingIds,
+    approvedTaskIds,
     safetyMetadataMap,
     deniedTaskIds,
     nodeMap,
     browserEvidence,
+    goalVerification,
     executionHistory,
     knowledgeStats,
+    planHash,
     approveTask,
     rejectTask,
     resetOrchestration,
@@ -74,15 +78,30 @@ export default function ExecutionControl() {
   }, [sessionId, metrics?.tasks_completed, loadEvidence]);
 
   let status = 'idle';
-  if (isSessionActive) {
+  if (goalVerification) {
+    if (goalVerification.overall_status === 'verified') status = 'verified';
+    else if (goalVerification.overall_status === 'failed') status = 'failed';
+    else if (goalVerification.overall_status === 'needs_human_review') status = 'needs review';
+    else if (goalVerification.overall_status === 'inconclusive') status = 'inconclusive';
+    else status = goalVerification.overall_status;
+  } else if (isSessionActive) {
     if (approvalPendingIds.size > 0) status = 'planning';
     else if (metrics && metrics.tasks_completed === metrics.tasks_total && metrics.tasks_total > 0) status = 'completed';
     else status = 'executing';
+  } else if (metrics && metrics.tasks_total > 0) {
+    if (metrics.tasks_failed > 0) status = 'failed';
+    else if (metrics.tasks_blocked > 0) status = 'blocked';
+    else if (metrics.tasks_completed === metrics.tasks_total) status = 'completed';
   }
 
-  const ardoLogs = executionEvents.map(e => {
-    return `[${e.task_id ? e.task_id.substring(0, 5) : 'SYS'}] ${e.event_type.replace('_', ' ').toUpperCase()} ${e.status ? '- ' + e.status : ''}`;
-  });
+  const ardoLogs = (executionEvents || [])
+    .filter(e => e != null)
+    .map(e => {
+      const eventTypeStr = typeof e.event_type === 'string' ? e.event_type.replace(/_/g, ' ').toUpperCase() : 'EVENT';
+      const taskId = e.task_id ? e.task_id.substring(0, 5) : 'SYS';
+      const statusText = e.status ? `- ${e.status}` : '';
+      return `[${taskId}] ${eventTypeStr} ${statusText}`;
+    });
   const logs = [...appLogs, ...ardoLogs];
 
   const handleReset = () => {
@@ -166,12 +185,20 @@ export default function ExecutionControl() {
                     <div className="flex items-center gap-3.5">
                       <div className={cn(
                         "h-11 w-11 rounded-xl flex items-center justify-center border transition-all",
-                        status === 'idle' ? "bg-slate-50 border-slate-200 text-slate-400" : "bg-teal-500 border-teal-600 text-white shadow-md shadow-teal-500/20"
+                        status === 'idle' ? "bg-slate-50 border-slate-200 text-slate-400" :
+                        status === 'verified' ? "bg-emerald-500 border-emerald-600 text-white shadow-md shadow-emerald-500/20" :
+                        status === 'failed' ? "bg-rose-500 border-rose-600 text-white shadow-md shadow-rose-500/20" :
+                        (status === 'needs review' || status === 'inconclusive' || status === 'planning') ? "bg-amber-500 border-amber-600 text-white shadow-md shadow-amber-500/20" :
+                        "bg-teal-500 border-teal-600 text-white shadow-md shadow-teal-500/20"
                       )}>
                         {status === 'idle' && <Timer className="h-5 w-5" />}
                         {status === 'planning' && <Zap className="h-5 w-5 animate-pulse" />}
                         {status === 'executing' && <Play className="h-5 w-5 fill-current" />}
                         {status === 'completed' && <CheckCircle2 className="h-5 w-5" />}
+                        {status === 'verified' && <CheckCircle2 className="h-5 w-5" />}
+                        {status === 'failed' && <AlertCircle className="h-5 w-5" />}
+                        {status === 'needs review' && <ShieldCheck className="h-5 w-5" />}
+                        {status === 'inconclusive' && <HelpCircle className="h-5 w-5" />}
                       </div>
                       <div className="flex flex-col gap-0.5">
                         <span className="text-xs font-bold text-slate-900 capitalize tracking-tight leading-none">{status} Status</span>
@@ -189,6 +216,8 @@ export default function ExecutionControl() {
                        <Terminal className="h-3.5 w-3.5 text-[#11999E]" /> Operational Telemetry
                      </h3>
                      <button 
+                        type="button"
+                        suppressHydrationWarning
                         onClick={() => setIsLogsExpanded(!isLogsExpanded)}
                         className="h-5 w-5 flex items-center justify-center rounded bg-slate-100 border border-slate-200 text-slate-500 hover:text-slate-800 transition-all"
                      >
@@ -246,9 +275,10 @@ export default function ExecutionControl() {
                           taskName={node?.task_name ?? taskId}
                           safetyMeta={safetyMeta}
                           sessionId={sessionId ?? ''}
-                          onApprove={(id) => approveTask(id)}
+                          planHash={planHash}
+                          onApprove={(id, hash, notes) => approveTask(id, hash, notes)}
                           onDeny={(id) => rejectTask(id)}
-                          isApproved={false}
+                          isApproved={approvedTaskIds?.has(taskId) ?? false}
                           isDenied={deniedTaskIds?.has(taskId) ?? false}
                         />
                       );
@@ -259,6 +289,8 @@ export default function ExecutionControl() {
                 <section className="pt-2 space-y-2 shrink-0">
                    <div className="flex flex-col gap-2">
                       <button 
+                        type="button"
+                        suppressHydrationWarning
                         onClick={handleReset}
                         className="w-full flex items-center justify-center gap-2 bg-white border border-slate-200 rounded-xl py-2.5 text-[11px] font-bold text-slate-600 transition-all hover:bg-slate-50 hover:text-slate-900 uppercase tracking-wider shadow-2xs"
                       >
@@ -269,14 +301,14 @@ export default function ExecutionControl() {
               </>
             )}
 
-            {/* ── EVIDENCE TAB: Playwright Browser Artifacts & Screenshots ─────── */}
+            {/* ── EVIDENCE TAB: Playwright Browser Artifacts & Cryptographic Verification ─────── */}
             {activeTab === 'evidence' && (
               <div className="space-y-4">
                 <div className="flex items-center justify-between border-b border-slate-200 pb-2.5">
                   <div className="flex items-center gap-2">
                     <Globe className="h-4 w-4 text-[#11999E]" />
                     <h3 className="text-xs font-bold uppercase tracking-wider text-slate-800">
-                      Browser Execution Evidence
+                      Execution Evidence & Outcome Verification
                     </h3>
                   </div>
                   <button 
@@ -287,30 +319,127 @@ export default function ExecutionControl() {
                   </button>
                 </div>
 
+                {/* Phase 3 Objective C: Goal-Level Outcome Verification Summary */}
+                {goalVerification && (
+                  <div className={cn(
+                    "rounded-xl border p-3.5 space-y-2 shadow-xs",
+                    goalVerification.overall_status === 'verified' ? "bg-emerald-50/70 border-emerald-200" :
+                    goalVerification.overall_status === 'failed' ? "bg-rose-50/70 border-rose-200" :
+                    goalVerification.overall_status === 'needs_human_review' ? "bg-amber-50/70 border-amber-200" :
+                    "bg-slate-50 border-slate-200"
+                  )}>
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <ShieldCheck className={cn(
+                          "h-4 w-4",
+                          goalVerification.overall_status === 'verified' ? "text-emerald-700" :
+                          goalVerification.overall_status === 'failed' ? "text-rose-700" :
+                          "text-amber-700"
+                        )} />
+                        <span className="text-xs font-bold uppercase tracking-wider text-slate-900">
+                          Goal Outcome Verification
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-[10px] font-semibold text-slate-600">
+                          {(goalVerification.confidence_score * 100).toFixed(0)}% Confidence
+                        </span>
+                        <span className={cn(
+                          "text-[9px] font-bold px-2 py-0.5 rounded border uppercase tracking-wider",
+                          goalVerification.overall_status === 'verified' ? "bg-emerald-100 text-emerald-800 border-emerald-300" :
+                          goalVerification.overall_status === 'failed' ? "bg-rose-100 text-rose-800 border-rose-300" :
+                          goalVerification.overall_status === 'needs_human_review' ? "bg-amber-100 text-amber-800 border-amber-300" :
+                          "bg-blue-100 text-blue-800 border-blue-300"
+                        )}>
+                          {goalVerification.overall_status.replace(/_/g, ' ')}
+                        </span>
+                      </div>
+                    </div>
+                    <p className="text-[11px] text-slate-700">
+                      {goalVerification.explanation}
+                    </p>
+                    <div className="flex items-center gap-4 text-[10px] text-slate-500 pt-1 border-t border-slate-200/60">
+                      <span>Tasks: <strong className="text-slate-700">{goalVerification.verified_tasks}/{goalVerification.total_tasks} Verified</strong></span>
+                      {goalVerification.failed_tasks > 0 && <span>Failed: <strong className="text-rose-600">{goalVerification.failed_tasks}</strong></span>}
+                      {goalVerification.inconclusive_tasks > 0 && <span>Inconclusive: <strong className="text-amber-600">{goalVerification.inconclusive_tasks}</strong></span>}
+                      <span className="ml-auto flex items-center gap-1 text-[9px] text-slate-400">
+                        <Lock className="h-3 w-3" /> Tenant Isolated
+                      </span>
+                    </div>
+                  </div>
+                )}
+
                 {browserEvidence.length > 0 ? (
                   <div className="space-y-4">
                     {browserEvidence.map((ev, idx) => (
                       <div key={idx} className="bg-white rounded-xl border border-slate-200 p-4 shadow-xs space-y-3">
-                        <div className="flex items-center justify-between">
-                          <span className="text-xs font-bold text-slate-800">{ev.task_name}</span>
-                          <span className={cn(
-                            "text-[9px] font-bold px-2 py-0.5 rounded border uppercase tracking-wider",
-                            ev.result?.success ? "bg-emerald-50 text-emerald-700 border-emerald-200" : "bg-rose-50 text-rose-700 border-rose-200"
-                          )}>
-                            {ev.result?.success ? 'VERIFIED' : 'FAILED'}
-                          </span>
+                        <div className="flex items-start justify-between gap-2">
+                          <div>
+                            <span className="text-xs font-bold text-slate-800 block">{ev.task_name || ev.task_id || 'Unnamed Task'}</span>
+                            <div className="flex items-center gap-1.5 mt-1">
+                              {ev.artifact_hash && (
+                                <span className="font-mono text-[9px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 border border-slate-200" title={`Full SHA-256: ${ev.artifact_hash}`}>
+                                  SHA-256: {ev.artifact_hash.slice(0, 10)}...
+                                </span>
+                              )}
+                              <span className="text-[9px] px-1.5 py-0.5 rounded bg-slate-50 text-slate-500 border border-slate-200">
+                                Privacy Redacted
+                              </span>
+                            </div>
+                          </div>
+                          <div className="flex flex-col items-end gap-1">
+                            <span className={cn(
+                              "text-[9px] font-bold px-2 py-0.5 rounded border uppercase tracking-wider",
+                              (ev.verification_status === 'verified' || ev.result?.success) ? "bg-emerald-50 text-emerald-700 border-emerald-200" :
+                              (ev.verification_status === 'failed' || ev.status === 'failed') ? "bg-rose-50 text-rose-700 border-rose-200" :
+                              (ev.verification_status === 'needs_human_review') ? "bg-amber-50 text-amber-700 border-amber-200" :
+                              "bg-slate-50 text-slate-700 border-slate-200"
+                            )}>
+                              {ev.verification_status ? ev.verification_status.replace(/_/g, ' ') : (ev.result?.success ? 'VERIFIED' : (ev.status === 'completed' ? 'FAILED' : (ev.status ? String(ev.status).toUpperCase() : 'PENDING')))}
+                            </span>
+                            {ev.confidence_score !== undefined && (
+                              <span className="text-[9px] font-medium text-slate-500">
+                                {(ev.confidence_score * 100).toFixed(0)}% conf
+                              </span>
+                            )}
+                          </div>
                         </div>
 
                         <div className="grid grid-cols-2 gap-2 text-[10px]">
                           <div className="bg-slate-50 p-2 rounded border border-slate-100">
                             <span className="text-slate-400 font-bold block">Action Type</span>
-                            <span className="font-mono font-semibold text-slate-700">{ev.action?.action_type || 'N/A'}</span>
+                            <span className="font-mono font-semibold text-slate-700">{ev.action?.action_type || 'Awaiting action'}</span>
                           </div>
                           <div className="bg-slate-50 p-2 rounded border border-slate-100">
                             <span className="text-slate-400 font-bold block">Target Selector</span>
-                            <span className="font-mono font-semibold text-slate-700 truncate block">{ev.action?.selector || 'Page Viewport'}</span>
+                            <span className="font-mono font-semibold text-slate-700 truncate block">{ev.action?.selector || ev.action?.url || 'Page Viewport'}</span>
                           </div>
                         </div>
+
+                        {ev.result?.error && (
+                          (() => {
+                            const errStr = String(ev.result.error);
+                            const isQuota = /quota|free[-_ ]tier|429|resource[-_ ]exhausted/i.test(errStr);
+                            if (isQuota) {
+                              return (
+                                <div className="bg-amber-50 border border-amber-300 rounded p-2.5 text-[10px] text-amber-900 space-y-1">
+                                  <div className="flex items-center gap-1.5 font-bold uppercase tracking-wider text-amber-800">
+                                    <AlertCircle className="h-3.5 w-3.5 text-amber-600" />
+                                    <span>AI Provider Quota Exhausted</span>
+                                  </div>
+                                  <p className="font-mono text-[9px] text-amber-800/90 leading-relaxed">
+                                    Upstream AI model quota limit reached. This is an API quota constraint, not a browser action failure.
+                                  </p>
+                                </div>
+                              );
+                            }
+                            return (
+                              <div className="bg-rose-50 border border-rose-200 rounded p-2 text-[10px] text-rose-800 font-mono">
+                                {errStr}
+                              </div>
+                            );
+                          })()
+                        )}
 
                         {ev.result?.text_extracted && (
                           <div className="bg-teal-50 border border-teal-200 rounded p-2.5">
@@ -453,7 +582,7 @@ export default function ExecutionControl() {
                         </p>
                         <div className="flex items-center justify-between text-[10px] text-slate-500 pt-1 border-t border-slate-100">
                           <span>Tasks: {item.tasks_completed ?? item.task_count}/{item.task_count}</span>
-                          <span>Duration: {item.duration_seconds.toFixed(1)}s</span>
+                          <span>Duration: {(item.duration_seconds != null ? Number(item.duration_seconds).toFixed(1) : '0.0')}s</span>
                         </div>
                       </div>
                     ))}

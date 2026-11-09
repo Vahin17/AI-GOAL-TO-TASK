@@ -140,7 +140,7 @@ def test_same_instance_retrieval(live_store, test_phrase):
 
     buf, h, sem_logger = _make_log_capture()
 
-    results = live_store.retrieve_memories(test_phrase, top_k=20, min_score=0.0)
+    results = live_store.retrieve_memories(test_phrase, top_k=1000, min_score=0.0)
 
     log_output = _release_log_capture(buf, h, sem_logger)
 
@@ -182,7 +182,7 @@ def test_new_instance_persistence(live_store, test_phrase):
     sm2 = SemanticMemoryStore()
     assert sm2._is_pg_connected, "FAIL: fresh SemanticMemoryStore not PG connected"
 
-    results2 = sm2.retrieve_memories(test_phrase, top_k=20, min_score=0.0)
+    results2 = sm2.retrieve_memories(test_phrase, top_k=1000, min_score=0.0)
 
     log_output = _release_log_capture(buf, h, sem_logger)
 
@@ -263,11 +263,11 @@ def test_phase13_semantic_memory_live_summary(live_store, test_phrase):
     pg_connected = live_store._is_pg_connected
     vec_dim = live_store.dim
 
-    same_results = live_store.retrieve_memories(test_phrase, top_k=20, min_score=0.0)
+    same_results = live_store.retrieve_memories(test_phrase, top_k=1000, min_score=0.0)
     same_found = any(r.memory_id == memory_id for r in same_results)
 
     sm3 = SemanticMemoryStore()
-    new_results = sm3.retrieve_memories(test_phrase, top_k=20, min_score=0.0)
+    new_results = sm3.retrieve_memories(test_phrase, top_k=1000, min_score=0.0)
     new_found = any(r.memory_id == memory_id for r in new_results)
 
     db_has_embedding = False

@@ -44,7 +44,7 @@ const PRESET_GOALS = [
 
 export default function ChatPanel() {
   const { messages, isTyping, addMessage, setTyping, addLog } = useAppStore();
-  const { startSession, mode: activeMode } = useARDOStore();
+  const { startSession, mode: activeMode, isSessionActive } = useARDOStore();
   const [inputValue, setInputValue] = useState('');
   const [selectedMode, setSelectedMode] = useState<'safe' | 'sequential' | 'parallel' | 'aggressive'>('safe');
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -57,8 +57,14 @@ export default function ChatPanel() {
 
   const handleSend = async (customPrompt?: string) => {
     const textToSend = (customPrompt || inputValue).trim();
-    if (!textToSend || isTyping) return;
+    if (!textToSend || isTyping || isSessionActive) {
+      if (isSessionActive) {
+        console.warn('[RUN-GUARD] handleSend blocked: session already active');
+      }
+      return;
+    }
 
+    console.log('[RUN-GUARD] frontend submit handler invoked', textToSend);
     setInputValue('');
     addMessage({ role: 'user', content: textToSend });
     setTyping(true);
@@ -71,12 +77,16 @@ export default function ChatPanel() {
         content: `Target objective analyzed and compiled into ARDO task DAG. Real-time orchestration active in ${selectedMode.toUpperCase()} mode.` 
       });
       addLog(`Reasoning Engine: ARDO session initialized successfully.`);
-    } catch (err) {
+    } catch (err: any) {
+      const msg = err?.message || String(err);
+      const cleanMsg = msg.replace(/^Error:\s*/, '');
+      const isReview = cleanMsg.toLowerCase().includes('review') || cleanMsg.toLowerCase().includes('clarification');
+
       addMessage({ 
         role: 'assistant', 
-        content: `Failed to synthesize plan: ${err}` 
+        content: isReview ? cleanMsg : `Failed to synthesize plan: ${cleanMsg}` 
       });
-      addLog(`Error: ${err}`);
+      addLog(isReview ? `Safety Guard: ${cleanMsg}` : `Error: ${cleanMsg}`);
     } finally {
       setTyping(false);
     }
@@ -228,10 +238,10 @@ export default function ChatPanel() {
           <div className="absolute right-2.5 top-1/2 -translate-y-1/2">
             <button 
               onClick={() => handleSend()}
-              disabled={!inputValue.trim() || isTyping}
+              disabled={!inputValue.trim() || isTyping || isSessionActive}
               className={cn(
                 "flex h-8 w-8 items-center justify-center rounded-lg transition-all shadow-xs active:scale-95",
-                inputValue.trim() && !isTyping
+                inputValue.trim() && !isTyping && !isSessionActive
                   ? "bg-[#11999E] text-white shadow-teal-500/20 hover:bg-[#0e7c80]"
                   : "bg-slate-200 text-slate-400 cursor-not-allowed shadow-none"
               )}

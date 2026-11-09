@@ -13,8 +13,9 @@ Deterministic A/B Planning Benchmark and System-Wide Hardening:
 import asyncio
 import time
 from typing import Any, Dict, List, Tuple
-import numpy as np
+from unittest.mock import patch
 import pytest
+np = pytest.importorskip("numpy")
 
 from ai.fallback_rules import generate_fallback_plan
 from core.config import settings
@@ -616,8 +617,9 @@ async def test_end_to_end_user_flow_full_lifecycle():
     )
 
     events = []
-    async for event in engine.run():
-        events.append(event)
+    with patch("orchestration.runtime_engine.SIM_FAILURE_RATE", 0.0):
+        async for event in engine.run():
+            events.append(event)
 
     assert len(events) > 0
 

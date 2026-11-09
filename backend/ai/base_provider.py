@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from typing import Optional
 from schemas.models import PlanGraphResponse
 
 class LLMProvider(ABC):
@@ -9,7 +10,12 @@ class LLMProvider(ABC):
     """
     
     @abstractmethod
-    async def generate_plan(self, goal: str, rag_context: str = "") -> PlanGraphResponse:
+    async def generate_plan(
+        self,
+        goal: str,
+        rag_context: str = "",
+        critic_feedback: Optional[str] = None,
+    ) -> PlanGraphResponse:
         """
         Takes a natural language goal and optional RAG context and converts it to a structured React Flow layout.
         

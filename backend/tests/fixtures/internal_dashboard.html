@@ -49,7 +49,7 @@
                 <tbody id="project-table-body">
                     <tr id="project-row-42">
                         <td>PRJ-042</td>
-                        <td id="project-name-cell">AI Goal-to-Task Execution Engine</td>
+                        <td id="project-name-cell"><a href="#project-desc-input" id="project-name-link" style="color: #38bdf8; text-decoration: none; cursor: pointer;">AI Goal-to-Task Execution Engine</a></td>
                         <td><span style="color: #34d399;">Active</span></td>
                         <td>SRE Team</td>
                     </tr>
@@ -88,7 +88,7 @@
             const query = document.getElementById('project-search-input').value;
             const nameCell = document.getElementById('project-name-cell');
             if (query.trim()) {
-                nameCell.innerText = 'AI Goal-to-Task Execution Engine [' + query.trim() + ']';
+                nameCell.innerHTML = '<a href="#project-desc-input" id="project-name-link" style="color: #38bdf8; text-decoration: none; cursor: pointer;">AI Goal-to-Task Execution Engine [' + query.trim() + ']</a>';
             }
         }
 

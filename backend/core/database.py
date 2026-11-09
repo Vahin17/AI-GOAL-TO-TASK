@@ -47,9 +47,23 @@ class Database:
     @classmethod
     async def close_db(cls):
         """Cleanly close connection."""
-        if cls.client:
+        if cls.client is not None:
             cls.client.close()
             logger.info("MongoDB connection closed.")
+
+    @classmethod
+    async def check_health(cls):
+        """Probes live MongoDB connection health and measures ping latency."""
+        import time
+        if cls.client is None:
+            return {"status": "unhealthy", "backend": "mongodb", "error": "Database client is not connected"}
+        start = time.time()
+        try:
+            await cls.client.admin.command("ping")
+            latency_ms = round((time.time() - start) * 1000, 2)
+            return {"status": "healthy", "backend": "mongodb", "latency_ms": latency_ms}
+        except Exception as e:
+            return {"status": "unhealthy", "backend": "mongodb", "error": str(e)}
 
     @classmethod
     async def bootstrap_collections(cls):
@@ -57,7 +71,7 @@ class Database:
         required_collections = [
             "goals", "plans", "tasks", "executions",
             "feedback", "safety_flags", "memory",
-            "users", "sessions",
+            "users", "sessions", "user_profiles",
             # ARDO Orchestration collections
             "orchestration_logs", "execution_metrics", "task_runtime_state",
         ]
@@ -113,6 +127,10 @@ class Database:
             await cls.db.execution_metrics.create_index("started_at")
 
             await cls.db.task_runtime_state.create_index("session_id", unique=True)
+
+            # ARDO User Profiles (synchronized from PostgreSQL authoritative store)
+            await cls.db.user_profiles.create_index("user_id", unique=True)
+            await cls.db.user_profiles.create_index("email")
 
             logger.info("Database indexes verified/created.")
         except Exception as e:

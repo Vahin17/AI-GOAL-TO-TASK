@@ -23,6 +23,8 @@ class BrowserActionType(str, Enum):
     SCREENSHOT        = "screenshot"
     GET_TITLE         = "get_title"
     GET_URL           = "get_url"
+    INSPECT_PAGE      = "inspect_page"
+    SCROLL            = "scroll"
 
 
 class BrowserAction(BaseModel):
@@ -36,6 +38,8 @@ class BrowserAction(BaseModel):
     key:         Optional[str] = None
     timeout_ms:  int = 5000
     description: Optional[str] = None
+    new_tab:     bool = False
+    metadata:    Dict[str, Any] = Field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -46,6 +50,8 @@ class BrowserAction(BaseModel):
             "key": self.key,
             "timeout_ms": self.timeout_ms,
             "description": self.description,
+            "new_tab": self.new_tab,
+            "metadata": self.metadata,
         }
 
 

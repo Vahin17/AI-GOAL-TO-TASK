@@ -38,9 +38,12 @@ class KnowledgeRetriever:
         top_k: Optional[int] = None,
         min_score: Optional[float] = None,
         filter_metadata: Optional[Dict[str, Any]] = None,
+        search_mode: str = "hybrid",
+        rrf_k: int = 60,
     ) -> RetrievalResult:
         """
-        Retrieves relevant document chunks for a natural language query.
+        Retrieves relevant document chunks for a natural language query using
+        hybrid (vector + tsvector full-text keyword with RRF), vector-only, or keyword-only search.
         """
         start_time = time.perf_counter()
         k = top_k if top_k is not None else self.default_top_k
@@ -57,12 +60,25 @@ class KnowledgeRetriever:
             )
 
         try:
-            matched_chunks = self.vector_store.query(
-                query_text=query,
-                top_k=k,
-                min_score=threshold,
-                filter_metadata=filter_metadata,
-            )
+            # Check if vector store supports search_mode and rrf_k
+            import inspect
+            sig = inspect.signature(self.vector_store.query)
+            if "search_mode" in sig.parameters:
+                matched_chunks = self.vector_store.query(
+                    query_text=query,
+                    top_k=k,
+                    min_score=threshold,
+                    filter_metadata=filter_metadata,
+                    search_mode=search_mode,
+                    rrf_k=rrf_k,
+                )
+            else:
+                matched_chunks = self.vector_store.query(
+                    query_text=query,
+                    top_k=k,
+                    min_score=threshold,
+                    filter_metadata=filter_metadata,
+                )
 
             latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
             status = "success" if matched_chunks else "empty"

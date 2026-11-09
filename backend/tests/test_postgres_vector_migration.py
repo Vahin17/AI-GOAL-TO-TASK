@@ -16,8 +16,8 @@ Deterministic verification for:
 """
 
 import time
-import numpy as np
 import pytest
+np = pytest.importorskip("numpy")
 
 from knowledge.chunking import TextChunker
 from knowledge.context_assembler import ContextAssembler

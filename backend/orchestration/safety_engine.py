@@ -90,7 +90,7 @@ class SafetyEngine:
             decisions[tid] = decision
 
             # Step 3: Persist safety record
-            if self.db:
+            if self.db is not None:
                 await self._persist_safety_record(
                     decision, session_id, goal_id, plan_id, task_name
                 )
@@ -131,7 +131,7 @@ class SafetyEngine:
             else:
                 logger.info(f"[SafetyEngine] Task={task_id} approved by operator.")
 
-            if self.db:
+            if self.db is not None:
                 await self._update_approval_record(
                     session_id, task_id, safety_record_id,
                     approved=result, binding=binding
@@ -140,7 +140,7 @@ class SafetyEngine:
         else:
             binding.deny()
             logger.info(f"[SafetyEngine] Task={task_id} denied by operator.")
-            if self.db:
+            if self.db is not None:
                 await self._update_approval_record(
                     session_id, task_id, safety_record_id,
                     approved=False, binding=binding
@@ -198,7 +198,7 @@ class SafetyEngine:
         plan_id: str,
         task_name: str,
     ) -> None:
-        if not self.db:
+        if self.db is None:
             return
         content_hash = SafetyRecord.compute_content_hash(task_name)
         record = SafetyRecord(
@@ -230,7 +230,7 @@ class SafetyEngine:
         approved: bool,
         binding: ApprovalBinding,
     ) -> None:
-        if not self.db:
+        if self.db is None:
             return
         update = {
             "$set": {

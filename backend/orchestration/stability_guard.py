@@ -282,10 +282,15 @@ class StabilityGuard:
         if ready:
             return []  # Tasks are available to run
 
-        # Check if non-terminal tasks remain
+        approval_needed = DependencyManager.get_approval_pending_tasks(graph)
+        if approval_needed:
+            return []  # Tasks are awaiting operator approval, not deadlocked
+
+        # Check if non-terminal tasks remain (excluding approval-needed tasks)
         stuck = [
             task_id for task_id, node in graph.nodes.items()
             if node.status in (TaskState.WAITING, TaskState.PENDING)
+            and not getattr(node, "approval_needed", False)
         ]
         if stuck:
             logger.error(

@@ -38,6 +38,7 @@ class PlanGraphResponse(BaseModel):
     Top level structured extraction model that nests the proper React Flow compatible nodes and edge graph response.
     """
     public_id: Optional[str] = Field(None, description="Public human-readable ID for the plan.")
+    goal_id: Optional[str] = Field(None, description="Public human-readable ID for the associated goal.")
     nodes: List[TaskNode] = Field(..., description="List of React Flow compatible task nodes.")
     edges: List[TaskEdge] = Field(..., description="List of React Flow compatible edges between the task nodes.")
     metadata: PlanGraphMetadata = Field(..., description="Metadata summarizing the AI response intent and reasoning.")
@@ -45,3 +46,6 @@ class PlanGraphResponse(BaseModel):
     safety_decisions: Optional[Dict[str, Any]] = Field(None, exclude=True, description="Internal: SafetyDecision map from SafetyEngine.")
     # Phase 6: Detailed RAG retrieval provenance
     provenance: Optional[Dict[str, Any]] = Field(default=None, description="Detailed RAG retrieval provenance metadata.")
+    # Phase 1: Canonical plan hash & critic verification result
+    plan_hash: Optional[str] = Field(default=None, description="Deterministic canonical SHA-256 hash of the complete plan.")
+    critic_result: Optional[Dict[str, Any]] = Field(default=None, description="Plan critic independent verification result.")

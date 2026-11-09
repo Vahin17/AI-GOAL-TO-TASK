@@ -2,6 +2,8 @@
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
 
+@custom-variant dark (&:where(.dark, .dark *));
+
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
@@ -47,6 +49,9 @@
 }
 
 :root {
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Fira Sans', 'Droid Sans', 'Helvetica Neue', sans-serif;
+  --font-heading: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Fira Sans', 'Droid Sans', 'Helvetica Neue', sans-serif;
+
   /* Strict SaaS Dashboard Palette Palette Palette Palette */
   --background: oklch(0.973 0.021 169.31); /* ~ #E4F9F5 */
   --foreground: oklch(0.395 0.019 169.31); /* ~ #40514E */
@@ -84,10 +89,10 @@
     transition: all 0.2s ease;
   }
   body {
-    @apply bg-background text-foreground tracking-tight h-full;
+    @apply bg-background text-foreground tracking-tight min-h-full;
   }
   html {
-    @apply font-sans h-full overflow-hidden;
+    @apply font-sans min-h-full;
   }
   h1, h2, h3, h4, h5, h6 {
     @apply font-semibold tracking-tighter leading-tight;

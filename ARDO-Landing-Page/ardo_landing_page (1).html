@@ -1,0 +1,1168 @@
+<!DOCTYPE html>
+<html lang="en" class="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ARDO — Autonomous Resilient Directed Orchestrator</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        ardoMint: '#10b981',
+                        ardoTeal: '#0d9488',
+                    },
+                    animation: {
+                        'pulse-slow': 'pulse 4s cubic-bezier(0.4, 0, 0.6, 1) infinite',
+                        'float': 'float 6s ease-in-out infinite',
+                    },
+                    keyframes: {
+                        float: {
+                            '0%, 100%': { transform: 'translateY(0px)' },
+                            '50%': { transform: 'translateY(-8px)' },
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <!-- Google Fonts Inter & JetBrains Mono -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+    <style>
+        /* Centralized Design Tokens for Light & Dark Themes matching ARDO identity */
+        :root {
+            --bg-main: #f0fdf4; /* Soft light mint green tint */
+            --bg-card: #ffffff;
+            --bg-card-hover: #f8fafc;
+            --text-main: #0f172a;
+            --text-muted: #475569;
+            --border-color: rgba(16, 185, 129, 0.15);
+            --accent-primary: #10b981;
+            --accent-secondary: #0d9488;
+            --glass-bg: rgba(255, 255, 255, 0.85);
+            --terminal-bg: #090a0f;
+            --code-text: #38bdf8;
+        }
+
+        .dark {
+            --bg-main: #090d0b; /* Deep charcoal with forest-green undertones */
+            --bg-card: #111c16;
+            --bg-card-hover: #16261e;
+            --text-main: #f1f5f9;
+            --text-muted: #94a3b8;
+            --border-color: rgba(16, 185, 129, 0.25);
+            --accent-primary: #34d399;
+            --accent-secondary: #2dd4bf;
+            --glass-bg: rgba(17, 28, 22, 0.85);
+            --terminal-bg: #050806;
+            --code-text: #34d399;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-main);
+            color: var(--text-main);
+            overflow-x: hidden;
+            transition: background-color 0.3s ease, color 0.3s ease;
+        }
+
+        .code-font {
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .ardo-panel {
+            background-color: var(--bg-card);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            border: 1px solid var(--border-color);
+            box-shadow: 0 4px 20px -2px rgba(16, 185, 129, 0.05);
+            transition: background-color 0.3s ease, border-color 0.3s ease, box-shadow 0.3s ease;
+        }
+
+        .ardo-panel:hover {
+            border-color: var(--accent-primary);
+            box-shadow: 0 0 25px rgba(16, 185, 129, 0.15);
+        }
+
+        .gradient-text {
+            background: linear-gradient(135deg, #10b981 0%, #0d9488 50%, #0284c7 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .dark .gradient-text {
+            background: linear-gradient(135deg, #34d399 0%, #2dd4bf 50%, #38bdf8 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+        ::-webkit-scrollbar-track {
+            background: var(--bg-main);
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #cbd5e1;
+            border-radius: 4px;
+        }
+        .dark ::-webkit-scrollbar-thumb {
+            background: #1e293b;
+        }
+    </style>
+    <script>
+        // Prevent theme flash on load
+        (function() {
+            const savedTheme = localStorage.getItem('ardo_theme') || 'light';
+            if (savedTheme === 'dark') {
+                document.documentElement.classList.add('dark');
+                document.documentElement.classList.remove('light');
+            } else {
+                document.documentElement.classList.remove('dark');
+                document.documentElement.classList.add('light');
+            }
+        })();
+    </script>
+</head>
+<body class="relative selection:bg-emerald-500 selection:text-white">
+
+    <!-- Background Particle Canvas -->
+    <canvas id="bgCanvas" class="fixed inset-0 pointer-events-none z-0 opacity-30"></canvas>
+
+    <!-- Navigation Bar -->
+    <header class="fixed top-0 left-0 right-0 z-50 ardo-panel border-b border-emerald-500/10 transition-all duration-300" id="navbar">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-20 flex items-center justify-between">
+            <div class="flex items-center space-x-3 cursor-pointer" onclick="window.scrollTo({top:0, behavior:'smooth'})">
+                <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-emerald-600 via-teal-600 to-cyan-600 flex items-center justify-center shadow-lg shadow-emerald-500/20">
+                    <i data-lucide="cpu" class="w-6 h-6 text-white animate-spin" style="animation-duration: 12s;"></i>
+                </div>
+                <div>
+                    <span class="text-xl font-bold tracking-tight">ARDO</span>
+                    <span class="text-xs block text-emerald-600 dark:text-emerald-400 code-font">AI Goal-to-Task Planning Engine</span>
+                </div>
+            </div>
+
+            <nav class="hidden md:flex items-center space-x-8 text-sm font-medium text-slate-600 dark:text-slate-300">
+                <a href="#simulator" class="hover:text-emerald-600 dark:hover:text-emerald-400 transition-colors">Live Simulator</a>
+                <a href="#architecture" class="hover:text-emerald-600 dark:hover:text-emerald-400 transition-colors">Architecture</a>
+                <a href="#techstack" class="hover:text-emerald-600 dark:hover:text-emerald-400 transition-colors">Tech Stack</a>
+                <a href="#features" class="hover:text-emerald-600 dark:hover:text-emerald-400 transition-colors">Features</a>
+            </nav>
+
+            <div class="flex items-center space-x-3">
+                <!-- Theme Toggle Button -->
+                <button onclick="toggleTheme()" class="p-2.5 rounded-xl ardo-panel hover:border-emerald-500 text-slate-700 dark:text-slate-300 transition-all" title="Toggle Light/Dark Theme">
+                    <i data-lucide="sun" class="w-4 h-4 hidden dark:block text-amber-400"></i>
+                    <i data-lucide="moon" class="w-4 h-4 block dark:hidden text-slate-700"></i>
+                </button>
+
+                <!-- Launch App CTA -->
+                <button onclick="launchApp()" class="hidden sm:inline-flex items-center space-x-2 px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-medium text-sm transition-all shadow-lg shadow-emerald-600/25 hover:scale-105">
+                    <i data-lucide="external-link" class="w-4 h-4"></i>
+                    <span>Launch ARDO Engine</span>
+                </button>
+
+                <a href="https://github.com" target="_blank" class="flex items-center space-x-2 px-3.5 py-2 rounded-xl ardo-panel font-medium text-sm transition-all">
+                    <i data-lucide="github" class="w-4 h-4"></i>
+                    <span class="hidden sm:inline">GitHub</span>
+                </a>
+            </div>
+        </div>
+    </header>
+
+    <!-- SECTION 1: HERO / LANDING SECTION -->
+    <section class="relative pt-32 pb-20 md:pt-44 md:pb-32 overflow-hidden z-10">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="grid grid-cols-1 lg:grid-cols-12 gap-12 items-center">
+                
+                <!-- Hero Text Left -->
+                <div class="lg:col-span-7 space-y-8 text-center lg:text-left">
+                    <div class="inline-flex items-center space-x-2 px-3.5 py-1.5 rounded-full ardo-panel border border-emerald-500/30 text-emerald-600 dark:text-emerald-400 text-xs font-semibold uppercase tracking-wider animate-bounce">
+                        <i data-lucide="sparkles" class="w-3.5 h-3.5"></i>
+                        <span>FINAL YEAR COMPUTER ENGINEERING PROJECT | 2026–2027</span>
+                    </div>
+
+                    <h1 class="text-4xl sm:text-6xl lg:text-7xl font-extrabold tracking-tight leading-tight">
+                        Turn Natural Language Goals Into <span class="gradient-text">Intelligent Execution Plans.</span>
+                    </h1>
+
+                    <p class="text-lg sm:text-xl text-slate-600 dark:text-slate-300 max-w-2xl mx-auto lg:mx-0 font-normal leading-relaxed">
+                        ARDO transforms high-level objectives into structured, dependency-aware DAGs using LLM-powered planning, Retrieval-Augmented Generation, semantic execution memory, and safety-aware orchestration.
+                    </p>
+
+                    <div class="flex flex-col sm:flex-row items-center justify-center lg:justify-start space-y-4 sm:space-y-0 sm:space-x-4">
+                        <a href="#simulator" class="w-full sm:w-auto px-8 py-4 rounded-xl bg-gradient-to-r from-emerald-600 via-teal-600 to-emerald-600 hover:from-emerald-500 hover:to-teal-500 text-white font-semibold transition-all duration-300 shadow-xl shadow-emerald-500/25 flex items-center justify-center space-x-3 group">
+                            <span>Explore Live Engine</span>
+                            <i data-lucide="arrow-right" class="w-5 h-5 group-hover:translate-x-1 transition-transform"></i>
+                        </a>
+                        <button onclick="launchApp()" class="w-full sm:w-auto px-8 py-4 rounded-xl ardo-panel font-semibold transition-all flex items-center justify-center space-x-2 hover:border-emerald-500">
+                            <i data-lucide="play-circle" class="w-5 h-5 text-emerald-600 dark:text-emerald-400"></i>
+                            <span>Launch Application</span>
+                        </button>
+                    </div>
+
+                    <!-- Verified project indicators -->
+                    <div class="grid grid-cols-3 gap-4 pt-6 border-t border-emerald-500/10 max-w-lg mx-auto lg:mx-0">
+                        <div>
+                            <div class="text-2xl font-bold text-slate-900 dark:text-white code-font">27</div>
+                            <div class="text-xs text-slate-500">Automated Tests Passed</div>
+                        </div>
+                        <div>
+                            <div class="text-2xl font-bold text-emerald-600 dark:text-emerald-400 code-font">4 Levels</div>
+                            <div class="text-xs text-slate-500">Risk Classifications</div>
+                        </div>
+                        <div>
+                            <div class="text-2xl font-bold text-teal-600 dark:text-teal-400 code-font">1500</div>
+                            <div class="text-xs text-slate-500">Token Context Budget</div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Hero Visual Right: Conceptual ARDO Workflow Preview -->
+                <div class="lg:col-span-5 relative">
+                    <div class="absolute -inset-1 rounded-2xl bg-gradient-to-r from-emerald-500 to-teal-500 opacity-20 blur-xl"></div>
+                    <div class="relative ardo-panel rounded-2xl p-6 shadow-2xl space-y-4">
+                        
+                        <!-- Header of preview card -->
+                        <div class="flex items-center justify-between pb-3 border-b border-emerald-500/10">
+                            <div class="flex items-center space-x-3">
+                                <div class="w-3 h-3 rounded-full bg-rose-500/80"></div>
+                                <div class="w-3 h-3 rounded-full bg-amber-500/80"></div>
+                                <div class="w-3 h-3 rounded-full bg-emerald-500/80"></div>
+                                <span class="text-xs code-font text-slate-500 ml-2">ardo-orchestrator.py</span>
+                            </div>
+                            <span class="px-2.5 py-1 rounded-md bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 text-xs font-semibold">DAG PIPELINE</span>
+                        </div>
+
+                        <!-- Goal prompt display -->
+                        <div class="space-y-1.5">
+                            <div class="text-xs text-slate-500 uppercase tracking-wider font-semibold">User Goal Objective</div>
+                            <div class="p-3 rounded-xl bg-slate-900 text-slate-100 dark:bg-black/80 border border-emerald-500/30 text-xs code-font text-emerald-300">
+                                "Research the latest papers on AI agents and summarize the important findings."
+                            </div>
+                        </div>
+
+                        <!-- Generated Tasks DAG workflow preview -->
+                        <div class="space-y-2.5">
+                            <div class="text-xs text-slate-500 uppercase tracking-wider font-semibold flex justify-between">
+                                <span>Conceptual Workflow Nodes</span>
+                                <span class="text-emerald-600 dark:text-emerald-400">6 Stages</span>
+                            </div>
+
+                            <!-- Task Node 1 -->
+                            <div class="p-2.5 rounded-xl ardo-panel flex items-center justify-between">
+                                <div class="flex items-center space-x-2.5">
+                                    <div class="w-6 h-6 rounded-lg bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 flex items-center justify-center text-xs font-bold">1</div>
+                                    <span class="text-xs font-medium text-slate-800 dark:text-white">Understand Research Objective</span>
+                                </div>
+                                <span class="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-700 dark:text-emerald-300 text-[10px]">Completed</span>
+                            </div>
+
+                            <!-- Task Node 2 -->
+                            <div class="p-2.5 rounded-xl ardo-panel flex items-center justify-between">
+                                <div class="flex items-center space-x-2.5">
+                                    <div class="w-6 h-6 rounded-lg bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 flex items-center justify-center text-xs font-bold">2</div>
+                                    <span class="text-xs font-medium text-slate-800 dark:text-white">Retrieve Relevant Knowledge (RAG)</span>
+                                </div>
+                                <span class="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-700 dark:text-emerald-300 text-[10px]">Completed</span>
+                            </div>
+
+                            <!-- Task Node 3 -->
+                            <div class="p-2.5 rounded-xl ardo-panel flex items-center justify-between">
+                                <div class="flex items-center space-x-2.5">
+                                    <div class="w-6 h-6 rounded-lg bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 flex items-center justify-center text-xs font-bold">3</div>
+                                    <span class="text-xs font-medium text-slate-800 dark:text-white">Generate Research Task DAG</span>
+                                </div>
+                                <span class="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-700 dark:text-emerald-300 text-[10px]">Completed</span>
+                            </div>
+
+                            <!-- Task Node 4 -->
+                            <div class="p-2.5 rounded-xl ardo-panel flex items-center justify-between">
+                                <div class="flex items-center space-x-2.5">
+                                    <div class="w-6 h-6 rounded-lg bg-teal-500/20 text-teal-600 dark:text-teal-400 flex items-center justify-center text-xs font-bold">4</div>
+                                    <span class="text-xs font-medium text-slate-800 dark:text-white">Validate Task Dependencies</span>
+                                </div>
+                                <span class="px-2 py-0.5 rounded bg-teal-500/20 text-teal-700 dark:text-teal-300 text-[10px] animate-pulse">Running</span>
+                            </div>
+
+                            <!-- Task Node 5 -->
+                            <div class="p-2.5 rounded-xl ardo-panel flex items-center justify-between opacity-85">
+                                <div class="flex items-center space-x-2.5">
+                                    <div class="w-6 h-6 rounded-lg bg-amber-500/20 text-amber-600 dark:text-amber-400 flex items-center justify-center text-xs font-bold">5</div>
+                                    <span class="text-xs font-medium text-slate-700 dark:text-slate-200">Execute Approved Tasks</span>
+                                </div>
+                                <span class="px-2 py-0.5 rounded bg-amber-500/20 text-amber-700 dark:text-amber-300 text-[10px]">Approval Req.</span>
+                            </div>
+
+                            <!-- Task Node 6 -->
+                            <div class="p-2.5 rounded-xl ardo-panel flex items-center justify-between opacity-60">
+                                <div class="flex items-center space-x-2.5">
+                                    <div class="w-6 h-6 rounded-lg bg-slate-500/20 text-slate-500 flex items-center justify-center text-xs font-bold">6</div>
+                                    <span class="text-xs font-medium text-slate-500">Store Execution Experience</span>
+                                </div>
+                                <span class="px-2 py-0.5 rounded bg-slate-500/20 text-slate-500 text-[10px]">Pending</span>
+                            </div>
+                        </div>
+
+                        <!-- Footer indicator -->
+                        <div class="pt-1 flex items-center justify-between text-xs text-slate-500 border-t border-emerald-500/10">
+                            <span>Status: Interactive Demo Preview</span>
+                            <span class="text-emerald-600 dark:text-emerald-400 font-semibold">ARDO v2026 Engine</span>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+        </div>
+    </section>
+
+    <!-- SECTION 2: LIVE SIMULATOR -->
+    <section id="simulator" class="py-24 relative z-10">
+        <div class="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="text-center space-y-4 mb-16">
+                <div class="inline-flex items-center space-x-2 px-3.5 py-1.5 rounded-full ardo-panel border border-emerald-500/30 text-emerald-600 dark:text-emerald-400 text-xs font-semibold uppercase tracking-wider">
+                    <i data-lucide="terminal" class="w-3.5 h-3.5"></i>
+                    <span>Frontend Demonstration Mode</span>
+                </div>
+                <h2 class="text-3xl sm:text-5xl font-bold tracking-tight">Experience Goal-to-Task Planning</h2>
+                <p class="text-slate-600 dark:text-slate-300 max-w-2xl mx-auto text-lg">
+                    Test the frontend demonstration simulation below, or click <strong class="text-emerald-600 dark:text-emerald-400">"Launch ARDO Engine"</strong> to open the main application.
+                </p>
+            </div>
+
+            <!-- Playground Box -->
+            <div class="ardo-panel rounded-3xl p-6 sm:p-10 shadow-2xl relative overflow-hidden">
+                <div class="absolute -right-20 -bottom-20 w-96 h-96 bg-emerald-500/10 rounded-full blur-3xl pointer-events-none"></div>
+
+                <div class="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+                    
+                    <!-- Left Config Panel -->
+                    <div class="lg:col-span-5 space-y-6">
+                        <div>
+                            <label class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">Select Preset Goal or Enter Custom</label>
+                            <div class="grid grid-cols-1 gap-2.5 mb-4">
+                                <button onclick="setGoal('Research the latest papers on AI agents and summarize the important findings.')" class="preset-btn text-left p-3 rounded-xl ardo-panel text-xs text-slate-700 dark:text-slate-300 hover:text-emerald-600 transition-all flex items-center justify-between group">
+                                    <span class="font-medium">📄 Research AI Agent Papers</span>
+                                    <i data-lucide="chevron-right" class="w-4 h-4 text-slate-400 group-hover:text-emerald-500 group-hover:translate-x-1 transition-all"></i>
+                                </button>
+                                <button onclick="setGoal('Develop a task management web application with user authentication and database integration.')" class="preset-btn text-left p-3 rounded-xl ardo-panel text-xs text-slate-700 dark:text-slate-300 hover:text-emerald-600 transition-all flex items-center justify-between group">
+                                    <span class="font-medium">💻 Build Task Management Web App</span>
+                                    <i data-lucide="chevron-right" class="w-4 h-4 text-slate-400 group-hover:text-emerald-500 group-hover:translate-x-1 transition-all"></i>
+                                </button>
+                                <button onclick="setGoal('Analyze a customer sales dataset and generate a report containing important business insights.')" class="preset-btn text-left p-3 rounded-xl ardo-panel text-xs text-slate-700 dark:text-slate-300 hover:text-emerald-600 transition-all flex items-center justify-between group">
+                                    <span class="font-medium">📊 Analyze Sales Dataset & Insights</span>
+                                    <i data-lucide="chevron-right" class="w-4 h-4 text-slate-400 group-hover:text-emerald-500 group-hover:translate-x-1 transition-all"></i>
+                                </button>
+                            </div>
+                        </div>
+
+                        <div>
+                            <label for="customGoalInput" class="block text-sm font-medium text-slate-700 dark:text-slate-300 mb-2">Custom Natural Language Goal</label>
+                            <textarea id="customGoalInput" rows="3" class="w-full rounded-xl bg-slate-900 text-slate-100 dark:bg-black/90 border border-emerald-500/20 p-4 text-sm code-font focus:outline-none focus:border-emerald-500 transition-colors" placeholder="Type any complex goal here...">Research the latest papers on AI agents and summarize the important findings.</textarea>
+                        </div>
+
+                        <div class="flex flex-col sm:flex-row items-center space-y-3 sm:space-y-0 sm:space-x-3 pt-2">
+                            <button onclick="executeEngine()" id="executeBtn" class="w-full sm:flex-1 py-4 px-6 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-semibold shadow-lg shadow-emerald-600/25 flex items-center justify-center space-x-2 transition-all active:scale-95">
+                                <i data-lucide="zap" class="w-5 h-5"></i>
+                                <span>Simulate Demo Pipeline</span>
+                            </button>
+                            <button onclick="launchApp()" class="w-full sm:w-auto py-4 px-6 rounded-xl bg-teal-700 hover:bg-teal-600 text-white font-semibold shadow-lg flex items-center justify-center space-x-2 transition-all">
+                                <i data-lucide="external-link" class="w-5 h-5"></i>
+                                <span>Launch ARDO Engine</span>
+                            </button>
+                            <button onclick="resetEngine()" class="p-4 rounded-xl ardo-panel text-slate-500 hover:text-slate-800 dark:hover:text-white transition-all" title="Reset Simulation">
+                                <i data-lucide="rotate-ccw" class="w-5 h-5"></i>
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Right Execution Log & Pipeline Stages Panel -->
+                    <div class="lg:col-span-7 space-y-4">
+                        <div class="flex items-center justify-between">
+                            <div class="flex items-center space-x-2">
+                                <div class="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-ping" id="statusDot"></div>
+                                <span class="text-sm font-semibold text-slate-800 dark:text-white" id="statusText">Demonstration Engine Ready</span>
+                            </div>
+                            <span class="text-xs text-slate-500 code-font" id="executionTimer">0.00s elapsed</span>
+                        </div>
+
+                        <!-- Output Container -->
+                        <div class="rounded-2xl bg-slate-900 dark:bg-black/90 border border-emerald-500/20 p-6 min-h-[380px] max-h-[460px] overflow-y-auto space-y-4" id="simOutput">
+                            <div class="text-center py-20 text-slate-400 space-y-3">
+                                <i data-lucide="cpu" class="w-12 h-12 mx-auto opacity-30 animate-pulse text-emerald-400"></i>
+                                <p class="text-sm">Click <strong class="text-emerald-400">"Simulate Demo Pipeline"</strong> to execute frontend workflow demonstration.</p>
+                            </div>
+                        </div>
+                    </div>
+
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- SECTION 3: ARCHITECTURE (7 Connected Stages + Feedback Loop + Supporting Infrastructure) -->
+    <section id="architecture" class="py-24 relative z-10 border-t border-emerald-500/10 bg-emerald-500/[0.02]">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="text-center space-y-4 mb-16">
+                <div class="inline-flex items-center space-x-2 px-3.5 py-1.5 rounded-full ardo-panel border border-emerald-500/30 text-emerald-600 dark:text-emerald-400 text-xs font-semibold uppercase tracking-wider">
+                    <i data-lucide="layers" class="w-3.5 h-3.5"></i>
+                    <span>Pipeline Architecture</span>
+                </div>
+                <h2 class="text-3xl sm:text-5xl font-bold tracking-tight">Inside the ARDO Intelligence Pipeline</h2>
+                <p class="text-slate-600 dark:text-slate-300 max-w-2xl mx-auto text-lg">
+                    A context-aware planning and orchestration architecture combining RAG, semantic memory, DAG validation, and safety-aware execution.
+                </p>
+            </div>
+
+            <!-- 7 Connected Stages Workflow -->
+            <div class="space-y-4 mb-16">
+                
+                <!-- Stage 01 -->
+                <div class="ardo-panel rounded-2xl p-6 relative flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+                    <div class="flex items-center space-x-4">
+                        <div class="w-12 h-12 rounded-xl bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 flex items-center justify-center font-bold text-lg code-font shrink-0">01</div>
+                        <div>
+                            <h3 class="text-lg font-bold text-slate-900 dark:text-white">Natural Language Goal Input</h3>
+                            <p class="text-sm text-slate-600 dark:text-slate-300">Users submit high-level objectives through the frontend dashboard and FastAPI REST endpoints.</p>
+                        </div>
+                    </div>
+                    <span class="px-3 py-1 rounded-full bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 text-xs font-semibold code-font">Frontend / API</span>
+                </div>
+
+                <div class="flex justify-center text-emerald-600 dark:text-emerald-400"><i data-lucide="arrow-down" class="w-6 h-6 animate-bounce"></i></div>
+
+                <!-- Stage 02 -->
+                <div class="ardo-panel rounded-2xl p-6 relative flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+                    <div class="flex items-center space-x-4">
+                        <div class="w-12 h-12 rounded-xl bg-teal-500/20 text-teal-600 dark:text-teal-400 flex items-center justify-center font-bold text-lg code-font shrink-0">02</div>
+                        <div>
+                            <h3 class="text-lg font-bold text-slate-900 dark:text-white">RAG Knowledge Retrieval</h3>
+                            <p class="text-sm text-slate-600 dark:text-slate-300">The system retrieves relevant information from ingested documents and previously stored semantic execution memories.</p>
+                        </div>
+                    </div>
+                    <span class="px-3 py-1 rounded-full bg-teal-500/10 text-teal-600 dark:text-teal-400 text-xs font-semibold code-font">PostgreSQL + pgvector</span>
+                </div>
+
+                <div class="flex justify-center text-emerald-600 dark:text-emerald-400"><i data-lucide="arrow-down" class="w-6 h-6 animate-bounce"></i></div>
+
+                <!-- Stage 03 -->
+                <div class="ardo-panel rounded-2xl p-6 relative flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+                    <div class="flex items-center space-x-4">
+                        <div class="w-12 h-12 rounded-xl bg-cyan-500/20 text-cyan-600 dark:text-cyan-400 flex items-center justify-center font-bold text-lg code-font shrink-0">03</div>
+                        <div>
+                            <h3 class="text-lg font-bold text-slate-900 dark:text-white">LLM-Based Goal Decomposition</h3>
+                            <p class="text-sm text-slate-600 dark:text-slate-300">LLM-based components use the goal and retrieved context to generate a structured task graph.</p>
+                        </div>
+                    </div>
+                    <span class="px-3 py-1 rounded-full bg-cyan-500/10 text-cyan-600 dark:text-cyan-400 text-xs font-semibold code-font">Gemini / OpenAI / LangChain</span>
+                </div>
+
+                <div class="flex justify-center text-emerald-600 dark:text-emerald-400"><i data-lucide="arrow-down" class="w-6 h-6 animate-bounce"></i></div>
+
+                <!-- Stage 04 -->
+                <div class="ardo-panel rounded-2xl p-6 relative flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+                    <div class="flex items-center space-x-4">
+                        <div class="w-12 h-12 rounded-xl bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 flex items-center justify-center font-bold text-lg code-font shrink-0">04</div>
+                        <div>
+                            <h3 class="text-lg font-bold text-slate-900 dark:text-white">DAG Validation & Dependency Resolution</h3>
+                            <p class="text-sm text-slate-600 dark:text-slate-300">The generated task graph is validated for structural correctness, dependency relationships, and acyclic execution order.</p>
+                        </div>
+                    </div>
+                    <span class="px-3 py-1 rounded-full bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 text-xs font-semibold code-font">Topological Sorting</span>
+                </div>
+
+                <div class="flex justify-center text-emerald-600 dark:text-emerald-400"><i data-lucide="arrow-down" class="w-6 h-6 animate-bounce"></i></div>
+
+                <!-- Stage 05 -->
+                <div class="ardo-panel rounded-2xl p-6 relative flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+                    <div class="flex items-center space-x-4">
+                        <div class="w-12 h-12 rounded-xl bg-amber-500/20 text-amber-600 dark:text-amber-400 flex items-center justify-center font-bold text-lg code-font shrink-0">05</div>
+                        <div>
+                            <h3 class="text-lg font-bold text-slate-900 dark:text-white">Safety Evaluation & Human Approval</h3>
+                            <p class="text-sm text-slate-600 dark:text-slate-300">Tasks undergo risk evaluation. High-risk operations require human authorization through the dashboard approval mechanism.</p>
+                        </div>
+                    </div>
+                    <span class="px-3 py-1 rounded-full bg-amber-500/10 text-amber-600 dark:text-amber-400 text-xs font-semibold code-font">Risk Gates (LOW–CRITICAL)</span>
+                </div>
+
+                <div class="flex justify-center text-emerald-600 dark:text-emerald-400"><i data-lucide="arrow-down" class="w-6 h-6 animate-bounce"></i></div>
+
+                <!-- Stage 06 -->
+                <div class="ardo-panel rounded-2xl p-6 relative flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+                    <div class="flex items-center space-x-4">
+                        <div class="w-12 h-12 rounded-xl bg-teal-500/20 text-teal-600 dark:text-teal-400 flex items-center justify-center font-bold text-lg code-font shrink-0">06</div>
+                        <div>
+                            <h3 class="text-lg font-bold text-slate-900 dark:text-white">Task Execution & Real-Time Monitoring</h3>
+                            <p class="text-sm text-slate-600 dark:text-slate-300">The execution engine manages task transitions and communicates execution progress, logs, and status updates through WebSockets.</p>
+                        </div>
+                    </div>
+                    <span class="px-3 py-1 rounded-full bg-teal-500/10 text-teal-600 dark:text-teal-400 text-xs font-semibold code-font">FastAPI + WebSockets</span>
+                </div>
+
+                <div class="flex justify-center text-emerald-600 dark:text-emerald-400"><i data-lucide="arrow-down" class="w-6 h-6 animate-bounce"></i></div>
+
+                <!-- Stage 07 -->
+                <div class="ardo-panel rounded-2xl p-6 relative flex flex-col md:flex-row items-start md:items-center justify-between gap-4 border-2 border-emerald-500/40">
+                    <div class="flex items-center space-x-4">
+                        <div class="w-12 h-12 rounded-xl bg-emerald-600 text-white flex items-center justify-center font-bold text-lg code-font shrink-0">07</div>
+                        <div>
+                            <h3 class="text-lg font-bold text-slate-900 dark:text-white">Feedback & Semantic Memory</h3>
+                            <p class="text-sm text-slate-600 dark:text-slate-300">Execution outcomes, success/failure information, and experiences are stored in semantic memory to inform future planning.</p>
+                        </div>
+                    </div>
+                    <span class="px-3 py-1 rounded-full bg-emerald-500/20 text-emerald-700 dark:text-emerald-300 text-xs font-semibold code-font">Semantic Execution Memory</span>
+                </div>
+
+            </div>
+
+            <!-- Feedback Loop Visual Indicator -->
+            <div class="max-w-4xl mx-auto mb-16 p-4 rounded-2xl ardo-panel border border-emerald-500/30 text-center flex items-center justify-center space-x-3 text-sm text-emerald-700 dark:text-emerald-300">
+                <i data-lucide="repeat" class="w-5 h-5 animate-spin" style="animation-duration: 8s;"></i>
+                <span><strong>Feedback Loop Active:</strong> Stage 07 continuously feeds historical execution experiences back into Stage 02 & 03 for self-improving planning.</span>
+            </div>
+
+            <!-- Supporting Infrastructure & Data Persistence -->
+            <div class="max-w-5xl mx-auto space-y-6">
+                <div class="text-center space-y-2">
+                    <h3 class="text-2xl font-bold text-slate-900 dark:text-white">Supporting Infrastructure & Data Persistence</h3>
+                    <p class="text-sm text-slate-600 dark:text-slate-300">Dedicated storage layers powering knowledge retrieval and execution state.</p>
+                </div>
+
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <!-- PostgreSQL + pgvector -->
+                    <div class="ardo-panel rounded-2xl p-6 space-y-3">
+                        <div class="flex items-center space-x-3">
+                            <div class="w-10 h-10 rounded-xl bg-blue-500/20 text-blue-600 dark:text-blue-400 flex items-center justify-center">
+                                <i data-lucide="database" class="w-5 h-5"></i>
+                            </div>
+                            <h4 class="text-lg font-bold text-slate-900 dark:text-white">PostgreSQL + pgvector</h4>
+                        </div>
+                        <ul class="space-y-2 text-xs text-slate-600 dark:text-slate-300 code-font">
+                            <li class="flex items-center space-x-2"><i data-lucide="check" class="w-3.5 h-3.5 text-emerald-500"></i><span>Knowledge document chunks & SHA-256 deduplication</span></li>
+                            <li class="flex items-center space-x-2"><i data-lucide="check" class="w-3.5 h-3.5 text-emerald-500"></i><span>Embedding storage & HNSW indexing</span></li>
+                            <li class="flex items-center space-x-2"><i data-lucide="check" class="w-3.5 h-3.5 text-emerald-500"></i><span>Semantic vector retrieval & cosine similarity search</span></li>
+                        </ul>
+                    </div>
+
+                    <!-- MongoDB -->
+                    <div class="ardo-panel rounded-2xl p-6 space-y-3">
+                        <div class="flex items-center space-x-3">
+                            <div class="w-10 h-10 rounded-xl bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 flex items-center justify-center">
+                                <i data-lucide="server" class="w-5 h-5"></i>
+                            </div>
+                            <h4 class="text-lg font-bold text-slate-900 dark:text-white">MongoDB</h4>
+                        </div>
+                        <ul class="space-y-2 text-xs text-slate-600 dark:text-slate-300 code-font">
+                            <li class="flex items-center space-x-2"><i data-lucide="check" class="w-3.5 h-3.5 text-emerald-500"></i><span>Execution state persistence & session tracking</span></li>
+                            <li class="flex items-center space-x-2"><i data-lucide="check" class="w-3.5 h-3.5 text-emerald-500"></i><span>Task information & operational telemetry logs</span></li>
+                            <li class="flex items-center space-x-2"><i data-lucide="check" class="w-3.5 h-3.5 text-emerald-500"></i><span>Real-time WebSocket event synchronization</span></li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+    </section>
+
+    <!-- SECTION 4: TECH STACK -->
+    <section id="techstack" class="py-24 relative z-10">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="text-center space-y-4 mb-16">
+                <div class="inline-flex items-center space-x-2 px-3.5 py-1.5 rounded-full ardo-panel border border-emerald-500/30 text-emerald-600 dark:text-emerald-400 text-xs font-semibold uppercase tracking-wider">
+                    <i data-lucide="cpu" class="w-3.5 h-3.5"></i>
+                    <span>Engineering Stack</span>
+                </div>
+                <h2 class="text-3xl sm:text-5xl font-bold tracking-tight">Built With Production-Grade Tech</h2>
+                <p class="text-slate-600 dark:text-slate-300 max-w-2xl mx-auto text-lg">
+                    Engineered for extreme performance, low latency, and robust type safety across the entire stack.
+                </p>
+            </div>
+
+            <!-- Stack Categories Grid -->
+            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                
+                <!-- Frontend -->
+                <div class="ardo-panel rounded-2xl p-6 space-y-3">
+                    <div class="w-12 h-12 rounded-xl bg-cyan-500/20 text-cyan-600 dark:text-cyan-400 flex items-center justify-center">
+                        <i data-lucide="code" class="w-6 h-6"></i>
+                    </div>
+                    <h3 class="text-lg font-bold text-slate-900 dark:text-white">Frontend</h3>
+                    <div class="flex flex-wrap gap-1.5">
+                        <span class="px-2 py-0.5 rounded bg-cyan-500/10 text-cyan-700 dark:text-cyan-300 text-xs code-font">Next.js 16</span>
+                        <span class="px-2 py-0.5 rounded bg-cyan-500/10 text-cyan-700 dark:text-cyan-300 text-xs code-font">React 19</span>
+                        <span class="px-2 py-0.5 rounded bg-cyan-500/10 text-cyan-700 dark:text-cyan-300 text-xs code-font">TypeScript</span>
+                        <span class="px-2 py-0.5 rounded bg-cyan-500/10 text-cyan-700 dark:text-cyan-300 text-xs code-font">Tailwind CSS</span>
+                        <span class="px-2 py-0.5 rounded bg-cyan-500/10 text-cyan-700 dark:text-cyan-300 text-xs code-font">Zustand</span>
+                        <span class="px-2 py-0.5 rounded bg-cyan-500/10 text-cyan-700 dark:text-cyan-300 text-xs code-font">React Flow</span>
+                    </div>
+                    <p class="text-sm text-slate-600 dark:text-slate-300 leading-relaxed pt-2">
+                        Interactive dashboard for DAG visualization, task monitoring, execution logs, and human approval controls.
+                    </p>
+                </div>
+
+                <!-- Backend -->
+                <div class="ardo-panel rounded-2xl p-6 space-y-3">
+                    <div class="w-12 h-12 rounded-xl bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 flex items-center justify-center">
+                        <i data-lucide="zap" class="w-6 h-6"></i>
+                    </div>
+                    <h3 class="text-lg font-bold text-slate-900 dark:text-white">Backend</h3>
+                    <div class="flex flex-wrap gap-1.5">
+                        <span class="px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 text-xs code-font">Python 3.11</span>
+                        <span class="px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 text-xs code-font">FastAPI</span>
+                        <span class="px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 text-xs code-font">Uvicorn</span>
+                        <span class="px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 text-xs code-font">Pydantic V2</span>
+                        <span class="px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 text-xs code-font">REST APIs</span>
+                        <span class="px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 text-xs code-font">WebSockets</span>
+                    </div>
+                    <p class="text-sm text-slate-600 dark:text-slate-300 leading-relaxed pt-2">
+                        Asynchronous backend infrastructure responsible for goal processing, planning, orchestration, and real-time communication.
+                    </p>
+                </div>
+
+                <!-- AI & LLM Integration -->
+                <div class="ardo-panel rounded-2xl p-6 space-y-3">
+                    <div class="w-12 h-12 rounded-xl bg-teal-500/20 text-teal-600 dark:text-teal-400 flex items-center justify-center">
+                        <i data-lucide="brain" class="w-6 h-6"></i>
+                    </div>
+                    <h3 class="text-lg font-bold text-slate-900 dark:text-white">AI & LLM Integration</h3>
+                    <div class="flex flex-wrap gap-1.5">
+                        <span class="px-2 py-0.5 rounded bg-teal-500/10 text-teal-700 dark:text-teal-300 text-xs code-font">Google Gemini</span>
+                        <span class="px-2 py-0.5 rounded bg-teal-500/10 text-teal-700 dark:text-teal-300 text-xs code-font">OpenAI</span>
+                        <span class="px-2 py-0.5 rounded bg-teal-500/10 text-teal-700 dark:text-teal-300 text-xs code-font">LangChain</span>
+                        <span class="px-2 py-0.5 rounded bg-teal-500/10 text-teal-700 dark:text-teal-300 text-xs code-font">Goal Decomposition</span>
+                        <span class="px-2 py-0.5 rounded bg-teal-500/10 text-teal-700 dark:text-teal-300 text-xs code-font">Fallbacks</span>
+                    </div>
+                    <p class="text-sm text-slate-600 dark:text-slate-300 leading-relaxed pt-2">
+                        LLM-powered reasoning and structured task generation with provider fallback mechanisms.
+                    </p>
+                </div>
+
+                <!-- RAG & Vector Search -->
+                <div class="ardo-panel rounded-2xl p-6 space-y-3">
+                    <div class="w-12 h-12 rounded-xl bg-blue-500/20 text-blue-600 dark:text-blue-400 flex items-center justify-center">
+                        <i data-lucide="search" class="w-6 h-6"></i>
+                    </div>
+                    <h3 class="text-lg font-bold text-slate-900 dark:text-white">RAG & Vector Search</h3>
+                    <div class="flex flex-wrap gap-1.5">
+                        <span class="px-2 py-0.5 rounded bg-blue-500/10 text-blue-700 dark:text-blue-300 text-xs code-font">RAG Pipeline</span>
+                        <span class="px-2 py-0.5 rounded bg-blue-500/10 text-blue-700 dark:text-blue-300 text-xs code-font">Embeddings</span>
+                        <span class="px-2 py-0.5 rounded bg-blue-500/10 text-blue-700 dark:text-blue-300 text-xs code-font">pgvector</span>
+                        <span class="px-2 py-0.5 rounded bg-blue-500/10 text-blue-700 dark:text-blue-300 text-xs code-font">HNSW Indexing</span>
+                        <span class="px-2 py-0.5 rounded bg-blue-500/10 text-blue-700 dark:text-blue-300 text-xs code-font">Cosine Similarity</span>
+                        <span class="px-2 py-0.5 rounded bg-blue-500/10 text-blue-700 dark:text-blue-300 text-xs code-font">Semantic Memory</span>
+                    </div>
+                    <p class="text-sm text-slate-600 dark:text-slate-300 leading-relaxed pt-2">
+                        Context-aware knowledge retrieval using vector embeddings, semantic similarity, and historical execution experiences.
+                    </p>
+                </div>
+
+                <!-- Database & Persistence -->
+                <div class="ardo-panel rounded-2xl p-6 space-y-3">
+                    <div class="w-12 h-12 rounded-xl bg-green-500/20 text-green-600 dark:text-green-400 flex items-center justify-center">
+                        <i data-lucide="server" class="w-6 h-6"></i>
+                    </div>
+                    <h3 class="text-lg font-bold text-slate-900 dark:text-white">Database & Persistence</h3>
+                    <div class="flex flex-wrap gap-1.5">
+                        <span class="px-2 py-0.5 rounded bg-green-500/10 text-green-700 dark:text-green-300 text-xs code-font">PostgreSQL</span>
+                        <span class="px-2 py-0.5 rounded bg-green-500/10 text-green-700 dark:text-green-300 text-xs code-font">pgvector</span>
+                        <span class="px-2 py-0.5 rounded bg-green-500/10 text-green-700 dark:text-green-300 text-xs code-font">MongoDB Atlas</span>
+                        <span class="px-2 py-0.5 rounded bg-green-500/10 text-green-700 dark:text-green-300 text-xs code-font">In-memory Fallback</span>
+                    </div>
+                    <p class="text-sm text-slate-600 dark:text-slate-300 leading-relaxed pt-2">
+                        PostgreSQL manages vector-based knowledge retrieval, while MongoDB handles execution persistence and operational state.
+                    </p>
+                </div>
+
+                <!-- Automation & Testing -->
+                <div class="ardo-panel rounded-2xl p-6 space-y-3">
+                    <div class="w-12 h-12 rounded-xl bg-amber-500/20 text-amber-600 dark:text-amber-400 flex items-center justify-center">
+                        <i data-lucide="shield-check" class="w-6 h-6"></i>
+                    </div>
+                    <h3 class="text-lg font-bold text-slate-900 dark:text-white">Automation & Testing</h3>
+                    <div class="flex flex-wrap gap-1.5">
+                        <span class="px-2 py-0.5 rounded bg-amber-500/10 text-amber-700 dark:text-amber-300 text-xs code-font">Playwright</span>
+                        <span class="px-2 py-0.5 rounded bg-amber-500/10 text-amber-700 dark:text-amber-300 text-xs code-font">pytest</span>
+                        <span class="px-2 py-0.5 rounded bg-amber-500/10 text-amber-700 dark:text-amber-300 text-xs code-font">pytest-asyncio</span>
+                        <span class="px-2 py-0.5 rounded bg-amber-500/10 text-amber-700 dark:text-amber-300 text-xs code-font">TS Validation</span>
+                    </div>
+                    <p class="text-sm text-slate-600 dark:text-slate-300 leading-relaxed pt-2">
+                        Browser automation infrastructure and automated testing for the RAG pipeline, vector-store operations, and application integration.
+                    </p>
+                </div>
+
+            </div>
+        </div>
+    </section>
+
+    <!-- SECTION 5: FEATURES / CORE ADVANTAGES -->
+    <section id="features" class="py-24 relative z-10 border-t border-emerald-500/10 bg-emerald-500/[0.01]">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="text-center space-y-4 mb-16">
+                <div class="inline-flex items-center space-x-2 px-3.5 py-1.5 rounded-full ardo-panel border border-emerald-500/30 text-emerald-600 dark:text-emerald-400 text-xs font-semibold uppercase tracking-wider">
+                    <i data-lucide="sparkles" class="w-3.5 h-3.5"></i>
+                    <span>Core Advantages</span>
+                </div>
+                <h2 class="text-3xl sm:text-5xl font-bold tracking-tight">Engineered for Reliability</h2>
+                <p class="text-slate-600 dark:text-slate-300 max-w-2xl mx-auto text-lg">
+                    Designed to handle complex real-world workflows without deadlocks or unhandled task failures.
+                </p>
+            </div>
+
+            <!-- 8 Cards Grid -->
+            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+                
+                <div class="ardo-panel rounded-2xl p-6 space-y-3">
+                    <div class="w-12 h-12 rounded-xl bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 flex items-center justify-center">
+                        <i data-lucide="database" class="w-6 h-6"></i>
+                    </div>
+                    <h3 class="text-lg font-bold text-slate-900 dark:text-white">1. Context-Aware RAG Retrieval</h3>
+                    <p class="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
+                        Retrieves relevant knowledge and contextual information before generating execution plans, reducing dependence on isolated LLM prompts.
+                    </p>
+                </div>
+
+                <div class="ardo-panel rounded-2xl p-6 space-y-3">
+                    <div class="w-12 h-12 rounded-xl bg-teal-500/20 text-teal-600 dark:text-teal-400 flex items-center justify-center">
+                        <i data-lucide="book-open" class="w-6 h-6"></i>
+                    </div>
+                    <h3 class="text-lg font-bold text-slate-900 dark:text-white">2. Semantic Execution Memory</h3>
+                    <p class="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
+                        Stores historical execution experiences, including successes and failures, to inform future planning and help avoid repeated mistakes.
+                    </p>
+                </div>
+
+                <div class="ardo-panel rounded-2xl p-6 space-y-3">
+                    <div class="w-12 h-12 rounded-xl bg-cyan-500/20 text-cyan-600 dark:text-cyan-400 flex items-center justify-center">
+                        <i data-lucide="git-merge" class="w-6 h-6"></i>
+                    </div>
+                    <h3 class="text-lg font-bold text-slate-900 dark:text-white">3. Intelligent DAG Generation</h3>
+                    <p class="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
+                        Transforms high-level natural-language goals into structured task graphs with explicit dependencies.
+                    </p>
+                </div>
+
+                <div class="ardo-panel rounded-2xl p-6 space-y-3">
+                    <div class="w-12 h-12 rounded-xl bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 flex items-center justify-center">
+                        <i data-lucide="check-circle" class="w-6 h-6"></i>
+                    </div>
+                    <h3 class="text-lg font-bold text-slate-900 dark:text-white">4. Dependency Validation</h3>
+                    <p class="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
+                        Validates task graphs for cycles and structural inconsistencies before execution.
+                    </p>
+                </div>
+
+                <div class="ardo-panel rounded-2xl p-6 space-y-3">
+                    <div class="w-12 h-12 rounded-xl bg-amber-500/20 text-amber-600 dark:text-amber-400 flex items-center justify-center">
+                        <i data-lucide="shield-alert" class="w-6 h-6"></i>
+                    </div>
+                    <h3 class="text-lg font-bold text-slate-900 dark:text-white">5. Human-in-the-Loop Safety</h3>
+                    <p class="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
+                        Uses risk classification and approval gates to ensure that high-risk operations require human authorization.
+                    </p>
+                </div>
+
+                <div class="ardo-panel rounded-2xl p-6 space-y-3">
+                    <div class="w-12 h-12 rounded-xl bg-teal-500/20 text-teal-600 dark:text-teal-400 flex items-center justify-center">
+                        <i data-lucide="cpu" class="w-6 h-6"></i>
+                    </div>
+                    <h3 class="text-lg font-bold text-slate-900 dark:text-white">6. Resilient Retrieval Architecture</h3>
+                    <p class="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
+                        Provides in-memory cosine similarity and deterministic local embedding fallbacks when external database or embedding services are unavailable.
+                    </p>
+                </div>
+
+                <div class="ardo-panel rounded-2xl p-6 space-y-3">
+                    <div class="w-12 h-12 rounded-xl bg-cyan-500/20 text-cyan-600 dark:text-cyan-400 flex items-center justify-center">
+                        <i data-lucide="activity" class="w-6 h-6"></i>
+                    </div>
+                    <h3 class="text-lg font-bold text-slate-900 dark:text-white">7. Real-Time Execution Monitoring</h3>
+                    <p class="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
+                        Uses WebSockets to communicate task status changes, execution logs, and approval requirements to the frontend.
+                    </p>
+                </div>
+
+                <div class="ardo-panel rounded-2xl p-6 space-y-3">
+                    <div class="w-12 h-12 rounded-xl bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 flex items-center justify-center">
+                        <i data-lucide="globe" class="w-6 h-6"></i>
+                    </div>
+                    <h3 class="text-lg font-bold text-slate-900 dark:text-white">8. Browser Automation Support</h3>
+                    <p class="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
+                        Uses Playwright-based browser automation for supported browser workflows, subject to execution policies and safety checks.
+                    </p>
+                </div>
+
+            </div>
+        </div>
+    </section>
+
+    <!-- SECTION 6: RELIABILITY GUARANTEE & STATUS -->
+    <section class="py-24 relative z-10">
+        <div class="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 space-y-12">
+            
+            <div class="ardo-panel rounded-3xl p-8 sm:p-12 relative overflow-hidden">
+                <div class="absolute -left-20 -top-20 w-80 h-80 bg-emerald-500/10 rounded-full blur-3xl pointer-events-none"></div>
+                <div class="space-y-6">
+                    <div class="inline-flex items-center space-x-2 px-3.5 py-1.5 rounded-full ardo-panel border border-emerald-500/30 text-emerald-600 dark:text-emerald-400 text-xs font-semibold uppercase tracking-wider">
+                        <i data-lucide="shield-check" class="w-3.5 h-3.5"></i>
+                        <span>Reliability Guarantee</span>
+                    </div>
+                    <h3 class="text-2xl sm:text-4xl font-bold tracking-tight">Built for Reliable AI Orchestration</h3>
+                    
+                    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 pt-4">
+                        <div class="p-4 rounded-xl ardo-panel space-y-2">
+                            <div class="text-emerald-600 dark:text-emerald-400 font-semibold text-sm">Context-Aware Planning</div>
+                            <p class="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">Replaces isolated prompting with robust retrieved knowledge and vector-backed ground truth.</p>
+                        </div>
+                        <div class="p-4 rounded-xl ardo-panel space-y-2">
+                            <div class="text-teal-600 dark:text-teal-400 font-semibold text-sm">Dependency-Validated Execution</div>
+                            <p class="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">Ensures tasks execute in strict topological order rather than unstructured task lists.</p>
+                        </div>
+                        <div class="p-4 rounded-xl ardo-panel space-y-2">
+                            <div class="text-cyan-600 dark:text-cyan-400 font-semibold text-sm">Historical Experience Retrieval</div>
+                            <p class="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">Learns from past execution outcomes to prevent recurring operational errors.</p>
+                        </div>
+                        <div class="p-4 rounded-xl ardo-panel space-y-2">
+                            <div class="text-amber-600 dark:text-amber-400 font-semibold text-sm">Safety Evaluation</div>
+                            <p class="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">Applies risk levels and human approval gates instead of unrestricted autonomous actions.</p>
+                        </div>
+                        <div class="p-4 rounded-xl ardo-panel space-y-2 lg:col-span-2">
+                            <div class="text-emerald-600 dark:text-emerald-400 font-semibold text-sm">Graceful Fallback Mechanisms</div>
+                            <p class="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">Maintains full operational continuity through deterministic local embeddings and in-memory vector fallback when external infrastructure is idle.</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Project Status Indicator -->
+            <div class="ardo-panel rounded-2xl p-6 sm:p-8 flex flex-col sm:flex-row items-center justify-between space-y-4 sm:space-y-0">
+                <div class="flex items-center space-x-4">
+                    <div class="w-3 h-3 rounded-full bg-emerald-500 animate-pulse shrink-0"></div>
+                    <div>
+                        <div class="text-sm font-bold tracking-wide">CORE ENGINE IMPLEMENTED</div>
+                        <p class="text-xs text-slate-500 mt-0.5">Currently progressing through live infrastructure verification, end-to-end testing, and final system evaluation.</p>
+                    </div>
+                </div>
+                <div class="px-4 py-2 rounded-xl ardo-panel text-xs text-emerald-600 dark:text-emerald-400 font-semibold shrink-0 code-font">
+                    Final Year Computer Engineering Project | 2026–2027
+                </div>
+            </div>
+
+        </div>
+    </section>
+
+    <!-- Footer -->
+    <footer class="py-12 border-t border-emerald-500/10 relative z-10 ardo-panel">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col md:flex-row items-center justify-between space-y-6 md:space-y-0">
+            
+            <div class="flex items-center space-x-3">
+                <div class="w-8 h-8 rounded-xl bg-gradient-to-tr from-emerald-600 to-teal-600 flex items-center justify-center">
+                    <i data-lucide="cpu" class="w-4 h-4 text-white"></i>
+                </div>
+                <div>
+                    <span class="text-base font-bold">ARDO – Autonomous Resilient Directed Orchestrator</span>
+                    <span class="text-xs block text-slate-500">AI Goal-to-Task Planning Engine</span>
+                </div>
+            </div>
+
+            <div class="text-center text-xs text-slate-500">
+                Final Year Computer Engineering Project | 2026–2027
+            </div>
+
+            <div class="flex items-center space-x-4">
+                <a href="https://github.com" target="_blank" class="p-2 rounded-xl ardo-panel text-slate-600 dark:text-slate-300 hover:text-emerald-500 transition-all">
+                    <i data-lucide="github" class="w-5 h-5"></i>
+                </a>
+                <button onclick="launchApp()" class="p-2 rounded-xl ardo-panel text-slate-600 dark:text-slate-300 hover:text-emerald-500 transition-all" title="Launch ARDO Engine">
+                    <i data-lucide="external-link" class="w-5 h-5"></i>
+                </button>
+            </div>
+
+        </div>
+    </footer>
+
+    <!-- JavaScript Application Logic -->
+    <script>
+        // Initialize Lucide icons
+        lucide.createIcons();
+
+        // Theme Toggle System with localStorage persistence
+        function toggleTheme() {
+            const htmlEl = document.documentElement;
+            if (htmlEl.classList.contains('dark')) {
+                htmlEl.classList.remove('dark');
+                htmlEl.classList.add('light');
+                localStorage.setItem('ardo_theme', 'light');
+            } else {
+                htmlEl.classList.remove('light');
+                htmlEl.classList.add('dark');
+                localStorage.setItem('ardo_theme', 'dark');
+            }
+            lucide.createIcons();
+        }
+
+        // Configurable Application Launcher for Main ARDO Application
+        function launchApp() {
+            // Configurable application URL environment variable or default placeholder modal
+            const appUrl = localStorage.getItem('ardo_app_url') || '';
+            if (appUrl) {
+                window.open(appUrl, '_blank');
+            } else {
+                // Professional modal notice for unconfigured destination
+                showModal("Launch ARDO Application", "The main ARDO application URL is not yet configured. You can set the destination URL or connect it to your deployed instance.");
+            }
+        }
+
+        function showModal(title, message) {
+            const existingModal = document.getElementById('ardoModal');
+            if (existingModal) existingModal.remove();
+
+            const modalHtml = `
+                <div id="ardoModal" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fadeIn">
+                    <div class="ardo-panel rounded-2xl max-w-md w-full p-6 space-y-4 shadow-2xl border border-emerald-500/30">
+                        <div class="flex items-center justify-between">
+                            <h3 class="text-lg font-bold text-slate-900 dark:text-white">${title}</h3>
+                            <button onclick="document.getElementById('ardoModal').remove()" class="text-slate-400 hover:text-slate-600 dark:hover:text-white">
+                                <i data-lucide="x" class="w-5 h-5"></i>
+                            </button>
+                        </div>
+                        <p class="text-sm text-slate-600 dark:text-slate-300 leading-relaxed">${message}</p>
+                        <div class="space-y-3 pt-2">
+                            <div>
+                                <label class="block text-xs font-semibold text-slate-500 mb-1">Configure Target Application URL:</label>
+                                <input type="text" id="targetAppUrlInput" placeholder="http://localhost:3000 or https://app.ardo.ai" class="w-full px-3 py-2 rounded-xl bg-slate-100 dark:bg-black/50 border border-emerald-500/30 text-xs code-font text-slate-800 dark:text-slate-200 focus:outline-none focus:border-emerald-500" value="${localStorage.getItem('ardo_app_url') || ''}">
+                            </div>
+                            <div class="flex items-center space-x-3 pt-2">
+                                <button onclick="saveAppUrl()" class="flex-1 py-2.5 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-xs transition-all">Save & Launch</button>
+                                <button onclick="document.getElementById('ardoModal').remove()" class="py-2.5 px-4 rounded-xl ardo-panel text-xs text-slate-600 dark:text-slate-300 hover:text-white">Close</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+            document.body.insertAdjacentHTML('beforeend', modalHtml);
+            lucide.createIcons();
+        }
+
+        function saveAppUrl() {
+            const url = document.getElementById('targetAppUrlInput').value.trim();
+            if (url) {
+                localStorage.setItem('ardo_app_url', url);
+                document.getElementById('ardoModal').remove();
+                window.open(url, '_blank');
+            }
+        }
+
+        // Background Particle Animation Canvas
+        const canvas = document.getElementById('bgCanvas');
+        const ctx = canvas.getContext('2d');
+        let width = canvas.width = window.innerWidth;
+        let height = canvas.height = window.innerHeight;
+
+        window.addEventListener('resize', () => {
+            width = canvas.width = window.innerWidth;
+            height = canvas.height = window.innerHeight;
+        });
+
+        const particles = [];
+        const particleCount = Math.min(Math.floor((width * height) / 18000), 65);
+
+        for (let i = 0; i < particleCount; i++) {
+            particles.push({
+                x: Math.random() * width,
+                y: Math.random() * height,
+                vx: (Math.random() - 0.5) * 0.4,
+                vy: (Math.random() - 0.5) * 0.4,
+                radius: Math.random() * 1.5 + 0.5
+            });
+        }
+
+        function animateCanvas() {
+            ctx.clearRect(0, 0, width, height);
+            const isDark = document.documentElement.classList.contains('dark');
+            ctx.fillStyle = isDark ? 'rgba(52, 211, 153, 0.12)' : 'rgba(16, 185, 129, 0.12)';
+            ctx.strokeStyle = isDark ? 'rgba(52, 211, 153, 0.06)' : 'rgba(16, 185, 129, 0.06)';
+
+            for (let i = 0; i < particles.length; i++) {
+                let p = particles[i];
+                p.x += p.vx;
+                p.y += p.vy;
+
+                if (p.x < 0) p.x = width;
+                if (p.x > width) p.x = 0;
+                if (p.y < 0) p.y = height;
+                if (p.y > height) p.y = 0;
+
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
+                ctx.fillStyle = isDark ? '#34d399' : '#10b981';
+                ctx.fill();
+
+                for (let j = i + 1; j < particles.length; j++) {
+                    let p2 = particles[j];
+                    let dist = Math.hypot(p.x - p2.x, p.y - p2.y);
+                    if (dist < 130) {
+                        ctx.beginPath();
+                        ctx.moveTo(p.x, p.y);
+                        ctx.lineTo(p2.x, p2.y);
+                        ctx.stroke();
+                    }
+                }
+            }
+            requestAnimationFrame(animateCanvas);
+        }
+        animateCanvas();
+
+        // Preset Goal Setter helper
+        function setGoal(goalText) {
+            document.getElementById('customGoalInput').value = goalText;
+            document.getElementById('simulator').scrollIntoView({ behavior: 'smooth' });
+        }
+
+        // Reset Simulator
+        function resetEngine() {
+            const simOutput = document.getElementById('simOutput');
+            simOutput.innerHTML = `
+                <div class="text-center py-20 text-slate-400 space-y-3">
+                    <i data-lucide="cpu" class="w-12 h-12 mx-auto opacity-30 animate-pulse text-emerald-400"></i>
+                    <p class="text-sm">Click <strong class="text-emerald-400">"Simulate Demo Pipeline"</strong> to execute frontend workflow demonstration.</p>
+                </div>
+            `;
+            document.getElementById('statusText').innerText = "Demonstration Engine Ready";
+            document.getElementById('statusDot').className = "w-2.5 h-2.5 rounded-full bg-emerald-500";
+            document.getElementById('executionTimer').innerText = "0.00s elapsed";
+            lucide.createIcons();
+        }
+
+        // Frontend Demonstration Mode Simulation
+        async function executeEngine() {
+            const goal = document.getElementById('customGoalInput').value.trim();
+            if (!goal) return;
+
+            const simOutput = document.getElementById('simOutput');
+            const statusText = document.getElementById('statusText');
+            const statusDot = document.getElementById('statusDot');
+            const timerEl = document.getElementById('executionTimer');
+            const executeBtn = document.getElementById('executeBtn');
+
+            executeBtn.disabled = true;
+            executeBtn.classList.add('opacity-50');
+
+            statusText.innerText = "Initializing Frontend Demo Session...";
+            statusDot.className = "w-2.5 h-2.5 rounded-full bg-emerald-400 animate-ping";
+
+            let startTime = performance.now();
+
+            simOutput.innerHTML = `
+                <div class="space-y-3 text-xs code-font">
+                    <div class="flex items-center space-x-2 text-emerald-400">
+                        <i data-lucide="loader" class="w-4 h-4 animate-spin"></i>
+                        <span>[Demo Simulation] Ingesting goal objective & evaluating local vector cache...</span>
+                    </div>
+                </div>
+            `;
+            lucide.createIcons();
+
+            await new Promise(r => setTimeout(r, 600));
+
+            simOutput.innerHTML += `
+                <div class="flex items-center space-x-2 text-teal-400">
+                    <i data-lucide="loader" class="w-4 h-4 animate-spin"></i>
+                    <span>[RAG Service] Querying pgvector similarity index with 1500-token context budget...</span>
+                </div>
+            `;
+            lucide.createIcons();
+            simOutput.scrollTop = simOutput.scrollHeight;
+
+            await new Promise(r => setTimeout(r, 800));
+
+            statusText.innerText = "Executing Planning & Safety Evaluation...";
+
+            let stages = [
+                { id: 1, title: "Natural Language Goal Understanding", tech: "Gemini / OpenAI LLM Decomposition", status: "completed" },
+                { id: 2, title: "RAG Context & Semantic Memory Retrieval", tech: "PostgreSQL + cosine similarity", status: "completed" },
+                { id: 3, title: "DAG Validation & Topological Sorting", tech: "Kahn's algorithm cycle check", status: "completed" },
+                { id: 4, title: "Safety Risk Evaluation & Approval Gate", tech: "Risk Level: MEDIUM (Approval Req.)", status: "approval_required" },
+                { id: 5, title: "Asynchronous Execution Management", tech: "FastAPI BackgroundTasks + WebSocket", status: "pending" }
+            ];
+
+            renderPipelineOutput(simOutput, stages, goal);
+
+            await new Promise(r => setTimeout(r, 1000));
+            stages[3].status = "completed";
+            stages[4].status = "running";
+            renderPipelineOutput(simOutput, stages, goal);
+
+            await new Promise(r => setTimeout(r, 900));
+            stages[4].status = "completed";
+            renderPipelineOutput(simOutput, stages, goal);
+
+            let endTime = performance.now();
+            let elapsed = ((endTime - startTime) / 1000).toFixed(2);
+            timerEl.innerText = `${elapsed}s elapsed`;
+
+            statusText.innerText = "Frontend Demonstration Completed Successfully!";
+            statusDot.className = "w-2.5 h-2.5 rounded-full bg-emerald-500";
+            executeBtn.disabled = false;
+            executeBtn.classList.remove('opacity-50');
+            lucide.createIcons();
+        }
+
+        function renderPipelineOutput(container, stages, goal) {
+            let html = `
+                <div class="space-y-3 text-xs code-font">
+                    <div class="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-300">
+                        <strong>Target Objective:</strong> "${escapeHtml(goal)}"
+                    </div>
+                    <div class="text-[10px] uppercase tracking-wider text-slate-400 font-semibold pt-2">Active ARDO Demonstration Pipeline</div>
+            `;
+
+            stages.forEach(s => {
+                let badgeClass = "bg-slate-800 text-slate-400";
+                let badgeText = "Pending";
+                let icon = `<div class="w-6 h-6 rounded-lg bg-slate-800 text-slate-400 flex items-center justify-center text-xs font-bold">${s.id}</div>`;
+
+                if (s.status === "completed") {
+                    badgeClass = "bg-emerald-500/20 text-emerald-300 border border-emerald-500/30";
+                    badgeText = "Completed";
+                    icon = `<div class="w-6 h-6 rounded-lg bg-emerald-500/20 text-emerald-400 flex items-center justify-center text-xs font-bold"><i data-lucide="check" class="w-3.5 h-3.5"></i></div>`;
+                } else if (s.status === "running") {
+                    badgeClass = "bg-teal-500/20 text-teal-300 border border-teal-500/30 animate-pulse";
+                    badgeText = "Running...";
+                    icon = `<div class="w-6 h-6 rounded-lg bg-teal-500/20 text-teal-400 flex items-center justify-center text-xs font-bold"><i data-lucide="loader" class="w-3.5 h-3.5 animate-spin"></i></div>`;
+                } else if (s.status === "approval_required") {
+                    badgeClass = "bg-amber-500/20 text-amber-300 border border-amber-500/30";
+                    badgeText = "Approval Req.";
+                    icon = `<div class="w-6 h-6 rounded-lg bg-amber-500/20 text-amber-400 flex items-center justify-center text-xs font-bold"><i data-lucide="shield-alert" class="w-3.5 h-3.5"></i></div>`;
+                }
+
+                html += `
+                    <div class="p-3.5 rounded-xl bg-white/[0.03] border border-emerald-500/10 flex items-center justify-between transition-all">
+                        <div class="flex items-center space-x-3">
+                            ${icon}
+                            <div>
+                                <div class="text-sm font-medium text-white">${s.title}</div>
+                                <div class="text-xs text-slate-400 code-font">${s.tech}</div>
+                            </div>
+                        </div>
+                        <span class="px-2.5 py-1 rounded-md text-xs font-semibold ${badgeClass}">${badgeText}</span>
+                    </div>
+                `;
+            });
+
+            html += `</div>`;
+            container.innerHTML = html;
+            container.scrollTop = container.scrollHeight;
+            lucide.createIcons();
+        }
+
+        function escapeHtml(text) {
+            return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+        }
+    </script>
+</body>
+</html>

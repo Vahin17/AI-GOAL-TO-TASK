@@ -156,16 +156,23 @@ class ReactiveRescheduler:
     ) -> List[str]:
         """
         Called when an operator approves a safety-gated task.
-        Transitions APPROVAL_NEEDED → ACTIVE and unblocks the queue.
+        Transitions APPROVAL_NEEDED → WAITING and unblocks the queue.
         """
         node = graph.get_node(task_id)
-        if node and node.status == TaskState.APPROVAL_NEEDED:
+        if node:
             node.approval_needed = False
-            node.status = TaskStateMachine.transition(
-                node.status, TaskState.ACTIVE, task_id
-            )
-            node.execution_logs.append("Operator approved. Transitioning to ACTIVE.")
-            logger.info(f"[Rescheduler] task={task_id} approved → ACTIVE")
+            if node.status == TaskState.APPROVAL_NEEDED:
+                node.status = TaskStateMachine.transition(
+                    node.status, TaskState.WAITING, task_id
+                )
+                node.execution_logs.append("Operator approved. Transitioning to WAITING.")
+                logger.info(f"[Rescheduler] task={task_id} approved → WAITING")
+            elif node.status == TaskState.PENDING and not node.dependency_ids:
+                node.status = TaskStateMachine.transition(
+                    node.status, TaskState.WAITING, task_id
+                )
+                node.execution_logs.append("Operator approved. Transitioning to WAITING.")
+                logger.info(f"[Rescheduler] task={task_id} approved (pending root) → WAITING")
 
         return self._rebuild_queue(graph)
 

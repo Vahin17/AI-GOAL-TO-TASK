@@ -70,11 +70,12 @@ class DependencyManager:
         """
         approval_needed: List[str] = []
         for task_id, node in graph.nodes.items():
+            if not getattr(node, "approval_needed", False):
+                continue
             if node.status == TaskState.APPROVAL_NEEDED:
                 approval_needed.append(task_id)
             elif (
                 node.status in (TaskState.PENDING, TaskState.WAITING)
-                and node.approval_needed
                 and DependencyManager._all_deps_completed(task_id, graph)
             ):
                 approval_needed.append(task_id)
