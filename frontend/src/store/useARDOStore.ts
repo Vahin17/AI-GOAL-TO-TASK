@@ -119,6 +119,7 @@ const DEFAULT_METRICS: SessionMetrics = {
   tasks_blocked: 0,
   tasks_retried: 0,
   total_retry_count: 0,
+  recovery_count: 0,
   reschedule_count: 0,
   approval_count: 0,
   throughput_per_minute: 0,

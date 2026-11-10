@@ -829,6 +829,36 @@ class RuntimeEngine:
                 try:
                     agent = self._get_browser_agent()
                     node_meta = getattr(node, "metadata", {}) or {}
+
+                    # Inspect predecessor tasks in the DAG for verified postcondition state
+                    precondition_url = None
+                    precondition_state = {}
+                    dep_ids = getattr(node, "dependency_ids", None) or getattr(node, "dependencies", None)
+                    if dep_ids:
+                        for dep_id in dep_ids:
+                            dep_node = self.graph.get_node(dep_id)
+                            if dep_node:
+                                dep_meta = getattr(dep_node, "metadata", {}) or {}
+                                dep_post = dep_meta.get("postcondition") or {}
+                                dep_res = getattr(dep_node, "browser_result", None)
+
+                                dep_url = None
+                                if dep_res and getattr(dep_res, "verification", None):
+                                    dep_url = getattr(dep_res.verification, "observed_url", None)
+                                if not dep_url and dep_res and getattr(dep_res, "observation", None):
+                                    dep_url = getattr(dep_res.observation, "current_url", None)
+                                if not dep_url:
+                                    dep_url = dep_post.get("url") or dep_meta.get("destination_url") or dep_meta.get("expected_url")
+
+                                if dep_url and not precondition_url:
+                                    precondition_url = dep_url
+                                precondition_state[dep_id] = {
+                                    "task_name": dep_node.task_name,
+                                    "url": dep_url,
+                                    "status": str(dep_node.status),
+                                    "postcondition": dep_post,
+                                }
+
                     btask = BrowserTask(
                         task_id=node.task_id,
                         objective=node.task_name,
@@ -837,8 +867,10 @@ class RuntimeEngine:
                         success_criteria=node_meta.get("success_criteria"),
                         constraints=node_meta.get("constraints", []),
                         metadata=node_meta,
+                        precondition_url=precondition_url,
+                        precondition_state=precondition_state or None,
                     )
-                    logger.info(f"[RuntimeEngine] Dispatching task {node.task_id} ('{node.task_name}') to BrowserAgent")
+                    logger.info(f"[RuntimeEngine] Dispatching task {node.task_id} ('{node.task_name}') to BrowserAgent (precondition_url='{precondition_url}')")
                     agent_res = await agent.run(btask)
                     node.browser_result = agent_res
                 except Exception as exc:
@@ -895,6 +927,21 @@ class RuntimeEngine:
                     node.completed_at = time.time()
                     if node.started_at:
                         node.actual_execution_time = node.completed_at - node.started_at
+
+                    # Record verified postcondition state for dependent tasks
+                    post_url = None
+                    post_title = None
+                    if agent_res.verification:
+                        post_url = getattr(agent_res.verification, "observed_url", None)
+                        post_title = getattr(agent_res.verification, "observed_title", None)
+                    if not post_url and agent_res.observation:
+                        post_url = getattr(agent_res.observation, "current_url", None)
+                        post_title = getattr(agent_res.observation, "page_title", None)
+                    node.metadata["postcondition"] = {
+                        "url": post_url,
+                        "title": post_title,
+                        "verified_at": time.time(),
+                    }
                     return True
 
             # 2. Non-browser Tool Execution via session-scoped ToolRegistry

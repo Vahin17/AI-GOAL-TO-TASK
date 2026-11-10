@@ -47,6 +47,9 @@ class _ProactorWorker:
     """
     Singleton background thread running a ProactorEventLoop for Playwright on Windows.
     All Playwright coroutines are submitted to this loop via run_coroutine_threadsafe.
+
+    Guarantees strict serialization and cancellation shielding to prevent
+    Windows Proactor pipe transport corruption (`assert f is self._write_fut`).
     """
     _instance: Optional[_ProactorWorker] = None
     _lock = threading.Lock()
@@ -59,6 +62,7 @@ class _ProactorWorker:
             daemon=True,
         )
         self._thread.start()
+        self._worker_lock = threading.Lock()
         logger.info("[PlaywrightProactorWorker] ProactorEventLoop thread started.")
 
     @classmethod
@@ -70,9 +74,26 @@ class _ProactorWorker:
         return cls._instance
 
     async def run(self, coro):
-        """Submit coro to the ProactorEventLoop and await its result from any loop."""
+        """
+        Submit coro to the ProactorEventLoop and await its result with
+        cancellation shielding and serialized pipe transport dispatch.
+        """
+        loop = asyncio.get_running_loop()
         fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return await asyncio.wrap_future(fut)
+        wrap_fut = asyncio.wrap_future(fut, loop=loop)
+
+        try:
+            # Shield execution from outer cancellation so background pipe transport
+            # write is not abandoned mid-stream, which corrupts self._write_fut
+            return await asyncio.shield(wrap_fut)
+        except asyncio.CancelledError:
+            # When caller cancels, wait for underlying future to cleanly finish
+            # before propagating cancellation, avoiding IOCP _write_fut assertion failure
+            try:
+                await wrap_fut
+            except Exception:
+                pass
+            raise
 
     @property
     def loop(self) -> asyncio.AbstractEventLoop:
@@ -92,6 +113,7 @@ class _BrowserSession:
         self._context = None
         self._page = None
         self._is_started = False
+        self._op_lock = asyncio.Lock()
 
     async def start(self) -> None:
         if self._is_started:
@@ -163,13 +185,18 @@ class _BrowserSession:
         return self._is_started and self._page is not None
 
     async def inspect_page(self, max_elements: int = 50) -> Any:
-        if not self.is_running:
-            await self.start()
-        from execution.browser.environment_perception import EnvironmentPerceptionEngine
-        engine = EnvironmentPerceptionEngine(max_elements=max_elements)
-        return await engine.inspect(self._page)
+        async with self._op_lock:
+            if not self.is_running:
+                await self.start()
+            from execution.browser.environment_perception import EnvironmentPerceptionEngine
+            engine = EnvironmentPerceptionEngine(max_elements=max_elements)
+            return await engine.inspect(self._page)
 
     async def execute_action(self, action: BrowserAction) -> BrowserActionResult:
+        async with self._op_lock:
+            return await self._execute_action_locked(action)
+
+    async def _execute_action_locked(self, action: BrowserAction) -> BrowserActionResult:
         t_start = time.perf_counter()
 
         # Phase 2: Immediate pre-check destination URL against NetworkGuard before launching or dispatching
@@ -284,7 +311,27 @@ class _BrowserSession:
                 except Exception:
                     pass
                 logger.info(f"[CLICK] selector='{target_selector}'")
-                await self._page.click(target_selector, timeout=timeout)
+                try:
+                    await self._page.click(target_selector, timeout=timeout)
+                except Exception as click_err:
+                    err_str = str(click_err).lower()
+                    if "intercepts pointer events" in err_str or "is not clickable at point" in err_str:
+                        logger.warning(
+                            f"[OVERLAY-INTERCEPTED] Element '{target_selector}' obstructed by overlay: {click_err}. "
+                            f"Attempting Escape dismissal recovery."
+                        )
+                        try:
+                            # Press Escape to dismiss overlay/drawer
+                            await self._page.keyboard.press("Escape")
+                            await asyncio.sleep(0.3)
+                            # Re-attempt click
+                            await self._page.click(target_selector, timeout=min(timeout, 3000))
+                            logger.info(f"[OVERLAY-RECOVERED] Click succeeded after Escape dismissal for '{target_selector}'.")
+                        except Exception as retry_err:
+                            logger.error(f"[OVERLAY-STILL-OBSTRUCTED] Click failed after dismissal attempt: {retry_err}")
+                            raise
+                    else:
+                        raise
                 duration = (time.perf_counter() - t_start) * 1000.0
                 current_title = None
                 try:

@@ -251,6 +251,55 @@ class SemanticVerifier:
                 failure_reason="Ambiguous state after mutating action; operator confirmation required.",
             )
 
+        # ── 6b. HTML5 Media Playback Verification (Phase 4.1 / Stabilization) ─
+        crit_lower = (task.success_criteria or "").lower()
+        is_playback_task = any(w in obj_lower for w in ("play ", "play the", "playback", "playing", "listen to")) or any(w in crit_lower for w in ("play", "playback", "playing"))
+        if is_playback_task:
+            media_elements = observation.media_state or []
+            if not media_elements and observation.page_snapshot and observation.page_snapshot.metadata:
+                media_elements = observation.page_snapshot.metadata.get("media_elements") or []
+
+            active_media = None
+            for m in media_elements:
+                if m.get("tag") in ("video", "audio"):
+                    if not m.get("paused") and m.get("currentTime", 0.0) > 0.0:
+                        active_media = m
+                        break
+
+            if active_media:
+                ct = active_media.get("currentTime", 0.0)
+                dur = active_media.get("duration", 0.0)
+                conf = 0.95 if ct >= 2.0 else 0.90
+                return BrowserVerification(
+                    task_id=task.task_id,
+                    status=BrowserVerificationStatus.VERIFIED,
+                    observed_url=url,
+                    observed_title=title,
+                    confidence_score=conf,
+                    verified_by=f"HTML5 media playback verified (tag={active_media.get('tag')}, currentTime={ct:.1f}s, duration={dur:.1f}s, playing=True)",
+                )
+            elif not media_elements:
+                return BrowserVerification(
+                    task_id=task.task_id,
+                    status=BrowserVerificationStatus.NOT_VERIFIED,
+                    observed_url=url,
+                    observed_title=title,
+                    confidence_score=0.20,
+                    verified_by="HTML5 media playback guard",
+                    failure_reason="No media element found on page; video not opened or still in search results.",
+                )
+            else:
+                paused_info = ", ".join(f"{m.get('tag')}(paused={m.get('paused')}, time={m.get('currentTime')}s)" for m in media_elements[:3])
+                return BrowserVerification(
+                    task_id=task.task_id,
+                    status=BrowserVerificationStatus.NOT_VERIFIED,
+                    observed_url=url,
+                    observed_title=title,
+                    confidence_score=0.30,
+                    verified_by="HTML5 media playback guard",
+                    failure_reason=f"Media element found but not actively playing: {paused_info}",
+                )
+
         # ── 7. Semantic text verification fallback ────────────────────────────
         matched, kw_reason = cls._verify_success_criteria(task.objective or "", observation)
         if matched:
@@ -334,6 +383,21 @@ class SemanticVerifier:
             else:
                 inconclusive_count += 1
 
+        task_confidences: List[float] = []
+        for tid, node in nodes.items():
+            c_score = None
+            if getattr(node, "browser_result", None) and getattr(node.browser_result, "verification", None):
+                c_score = getattr(node.browser_result.verification, "confidence_score", None)
+            if c_score is None and evidence_items:
+                for ev in evidence_items:
+                    if ev.get("task_id") == tid and ev.get("confidence_score") is not None:
+                        c_score = float(ev["confidence_score"])
+                        break
+            if c_score is not None:
+                task_confidences.append(float(c_score))
+
+        mean_conf = (sum(task_confidences) / len(task_confidences)) if task_confidences else 0.70
+
         if failed_count > 0:
             overall = "failed"
             conf = 0.90
@@ -344,11 +408,12 @@ class SemanticVerifier:
             explanation = f"Goal requires operator review: {needs_review_count} task(s) in uncertain or approval state."
         elif verified_count == total:
             overall = "verified"
-            conf = 0.95
-            explanation = f"Goal fully verified: all {total} task(s) completed and backed by evidence."
+            # Mathematically computed confidence: bounded by aggregate task confidence
+            conf = round(min(0.99, max(0.50, mean_conf)), 2)
+            explanation = f"Goal fully verified: all {total} task(s) completed (aggregate confidence: {conf * 100:.1f}% based on {len(task_confidences)} verified task scores)."
         else:
             overall = "inconclusive"
-            conf = 0.40
+            conf = round(min(0.50, max(0.10, mean_conf * (verified_count / total))), 2)
             explanation = f"Goal incomplete: {verified_count}/{total} tasks verified, {inconclusive_count} remaining."
 
         return GoalVerificationResult(

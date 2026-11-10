@@ -96,6 +96,13 @@ class PlaybookService:
         playbook_id = f"pb_{uuid.uuid4().hex[:12]}"
         plan_hash = getattr(graph, "plan_hash", "") or "unhashed"
 
+        meta = {
+            "discovered_from_session": session_id,
+            "total_steps": len(steps),
+            "verification_status": goal_verification.overall_status,
+            "confidence_score": goal_verification.confidence_score,
+        }
+
         auth_db = AuthDatabase.get_instance()
         doc = auth_db.record_playbook(
             id=playbook_id,
@@ -112,8 +119,21 @@ class PlaybookService:
             status="candidate",
             confidence_score=max(0.5, min(0.95, goal_verification.confidence_score)),
             version=1,
-            metadata={"discovered_from_session": session_id, "total_steps": len(steps)},
+            metadata=meta,
         )
+
+        # Mirror candidate playbook to MongoDB if database is available
+        try:
+            from core.database import get_database
+            mongo_db = get_database()
+            if mongo_db is not None:
+                mongo_db["candidate_playbooks"].replace_one(
+                    {"id": playbook_id},
+                    dict(doc),
+                    upsert=True,
+                )
+        except Exception as me:
+            logger.debug(f"[PlaybookService] MongoDB candidate playbook sync note: {me}")
 
         logger.info(
             f"[PlaybookService] Created candidate playbook {playbook_id} for user {user_id} "
@@ -153,6 +173,23 @@ class PlaybookService:
 
         if pb.get("status") not in ("candidate", "promoted"):
             logger.warning(f"[PlaybookService] Cannot promote playbook in '{pb.get('status')}' state.")
+            return False
+
+        # Invariant: Reject promotion if execution outcome was unverified or confidence is insufficient
+        conf = float(pb.get("confidence_score") or 0.0)
+        pb_meta = pb.get("metadata") or {}
+        if isinstance(pb_meta, str):
+            try:
+                pb_meta = json.loads(pb_meta)
+            except Exception:
+                pb_meta = {}
+        verif_status = pb_meta.get("verification_status")
+
+        if conf < 0.50 or verif_status in ("unverified", "failed", "inconclusive"):
+            logger.warning(
+                f"[PlaybookService] Cannot promote playbook {playbook_id}: outcome was unverified "
+                f"(status='{verif_status}', confidence={conf})."
+            )
             return False
 
         success = auth_db.update_playbook_status(

@@ -77,6 +77,7 @@ class SessionMetrics:
     tasks_retried: int = 0
 
     total_retry_count: int = 0
+    recovery_count: int = 0
     reschedule_count: int = 0
     approval_count: int = 0
 
@@ -142,6 +143,7 @@ class SessionMetrics:
             "tasks_blocked": self.tasks_blocked,
             "tasks_retried": self.tasks_retried,
             "total_retry_count": self.total_retry_count,
+            "recovery_count": self.recovery_count,
             "reschedule_count": self.reschedule_count,
             "approval_count": self.approval_count,
             "throughput_per_minute": self.throughput_per_minute,
@@ -414,6 +416,7 @@ class ExecutionMonitor:
     def on_recovery_started(
         self, task_id: str, task_name: str, reason: str, attempt: int = 1, max_budget: int = 3
     ) -> OrchestrationEvent:
+        self.metrics.recovery_count += 1
         return self.emit(OrchestrationEvent(
             event_type="recovery_started",
             session_id=self.session_id,

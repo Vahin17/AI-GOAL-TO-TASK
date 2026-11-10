@@ -219,6 +219,35 @@ class BrowserAgent:
             decision: Optional[BrowserDecision] = None
             is_explicit: bool = False
 
+            # Check prerequisite state from upstream tasks before first action
+            if (
+                decision is None
+                and len(actions_taken) == 0
+                and consecutive_recovery_count == 0
+                and task.precondition_url
+            ):
+                norm_pre = SemanticVerifier._normalize_url(task.precondition_url)
+                norm_cur = SemanticVerifier._normalize_url(observation.current_url or "")
+                url_match, _ = SemanticVerifier._verify_url([norm_pre], observation.current_url or "")
+                if not url_match and (norm_pre.startswith("http://") or norm_pre.startswith("https://")):
+                    logger.warning(
+                        f"[BrowserAgent] Precondition URL mismatch: current='{observation.current_url}', "
+                        f"expected prerequisite='{task.precondition_url}'. Triggering prerequisite navigation recovery."
+                    )
+                    self._emit_event("precondition_mismatch", task, {
+                        "current_url": observation.current_url,
+                        "expected_url": task.precondition_url,
+                    })
+                    decision = BrowserDecision(
+                        decision=BrowserDecisionType.EXECUTE,
+                        reason=f"Navigate to prerequisite URL '{task.precondition_url}'",
+                        action=BrowserActionDecision(
+                            action_type=BrowserActionType.NAVIGATE,
+                            url=task.precondition_url,
+                        ),
+                    )
+                    is_explicit = True
+
             # Fast-path 1: If an action was executed, verify if an atomic task is already fully satisfied
             obj_lower = (task.objective or "").lower()
             is_atomic_task = (
@@ -918,37 +947,107 @@ class BrowserAgent:
         Extracts search query if task objective or metadata specifies a search action.
         Returns None if not a search task or query cannot be extracted.
         """
+        UI_TARGET_WORDS = {
+            "bar", "search bar", "searchbar", "searchbox", "search box",
+            "input", "input field", "button", "search button", "search",
+            "box", "field", "query", "text", "form",
+        }
+
+        # 1. Authoritative task contract / metadata fast path
         if task.metadata:
-            for k in ("search_query", "query", "search_term"):
-                if task.metadata.get(k):
-                    return str(task.metadata[k]).strip()
+            for k in ("search_query", "query", "search_term", "target_phrase"):
+                val = task.metadata.get(k)
+                if val:
+                    val_str = str(val).strip().strip("\"'.,;!?")
+                    if val_str.lower() not in UI_TARGET_WORDS and len(val_str) > 1:
+                        return val_str
 
         obj = (task.objective or "").strip()
+        if not obj:
+            return None
         obj_lower = obj.lower()
 
         # If the task includes video selection, playback, or downstream interactions (e.g. "and play the song"),
         # do not fast-path as a simple search task; preserve full reasoning loop.
-        if any(w in obj_lower for w in ("play", "click", "watch", "select", "download", "buy", "order")):
+        if any(w in obj_lower for w in ("play", "click", "watch", "select", "download", "buy", "order", "listen")):
             return None
 
         # Compound multi-step task (e.g. "Open X and search for Y") preserves full dynamic reasoning
         if re.search(r'\b(?:and|then)\s+search\b', obj_lower) or (obj_lower.startswith("open ") and " and " in obj_lower):
             return None
 
-        # Regex matching on search intent:
-        patterns = [
-            r'(?:inside|on|at|in)\s+[a-zA-Z0-9_\.\-]+\s+search\s+(?:for\s+)?["\']?([^"\'\n\r]+?)["\']?(?:\s+(?:and|then)\s+.*)?$',
-            r'search\s+(?:for\s+)?["\']?([^"\'\n\r]+?)["\']?(?:\s+(?:on|in|inside)\s+[a-zA-Z0-9_\.\-]+)?(?:\s+(?:and|then)\s+.*)?$',
-            r'find\s+(?:for\s+)?["\']?([^"\'\n\r]+?)["\']?(?:\s+(?:on|in|inside)\s+[a-zA-Z0-9_\.\-]+)?(?:\s+(?:and|then)\s+.*)?$',
-        ]
-        for pat in patterns:
-            m = re.search(pat, obj, re.IGNORECASE)
-            if m:
-                query = m.group(1).strip().rstrip(".,;!?")
-                query = re.sub(r'^(?:for|the|song|video)\s+', '', query, flags=re.IGNORECASE).strip()
-                query = re.sub(r'\s+(?:song|video)$', '', query, flags=re.IGNORECASE).strip()
-                if query and len(query) > 1:
-                    return query
+        # If the objective is simply naming a UI element, never extract it as a search query
+        if obj_lower in UI_TARGET_WORDS:
+            return None
+
+        # 2. Quoted query extraction (highest precision)
+        quote_match = re.search(
+            r'(?:search|find|look\s+up)\s+(?:for\s+)?["\']([^"\'\n\r]+)["\']',
+            obj,
+            re.IGNORECASE,
+        )
+        if not quote_match:
+            quote_match = re.search(
+                r'(?:inside|on|at|in)\s+[a-zA-Z0-9_\.\-]+\s+(?:search|find|look\s+up)\s+(?:for\s+)?["\']([^"\'\n\r]+)["\']',
+                obj,
+                re.IGNORECASE,
+            )
+        if quote_match:
+            q = quote_match.group(1).strip().strip(".,;!?")
+            if q.lower() not in UI_TARGET_WORDS and len(q) > 1:
+                return q
+
+        # 3. Clean trailing UI element suffixes and destination platform suffixes
+        s = obj
+        # Strip trailing UI qualifiers like "on YouTube search bar", "in the search box", "into search bar"
+        s = re.sub(
+            r'\s+(?:in|on|into|using|via)\s+(?:the\s+)?(?:[a-zA-Z0-9_\.\-]+\s+)?search\s*(?:bar|box|input|field|form)\b.*$',
+            '',
+            s,
+            flags=re.IGNORECASE,
+        )
+        # Strip trailing platform specifiers like "on YouTube", "in YouTube", "on Google"
+        s = re.sub(
+            r'\s+(?:on|in|inside|at)\s+(?:youtube|google|bing|spotify|vimeo|soundcloud|wikipedia|amazon|duckduckgo)\b.*$',
+            '',
+            s,
+            flags=re.IGNORECASE,
+        )
+        # Strip generic domain suffixes like "on youtube.com"
+        s = re.sub(
+            r'\s+(?:on|in|inside)\s+[a-zA-Z0-9_\.\-]+(?:\.(?:com|org|net|io|co))?\b.*$',
+            '',
+            s,
+            flags=re.IGNORECASE,
+        )
+
+        # Strip prefixes (longest / most specific patterns first)
+        s = re.sub(
+            r'^(?:in|on|inside|at)\s+[a-zA-Z0-9_\.\-]+\s*[,:]?\s*(?:please\s+)?(?:search|find|look\s+up)\s+(?:for\s+)?',
+            '',
+            s,
+            flags=re.IGNORECASE,
+        )
+        s = re.sub(
+            r'^(?:please\s+)?(?:search|find)\s+[a-zA-Z0-9_\.\-]+\s+for\s+',
+            '',
+            s,
+            flags=re.IGNORECASE,
+        )
+        s = re.sub(
+            r'^(?:please\s+)?(?:search|find|look\s+up)\s+(?:for\s+)?',
+            '',
+            s,
+            flags=re.IGNORECASE,
+        )
+
+        query = s.strip().strip("\"'.,;!?")
+        # Strip generic leading/trailing media qualifiers that are part of prompt phrasing
+        query = re.sub(r'^(?:for|the|song|video|track)\s+', '', query, flags=re.IGNORECASE).strip()
+        query = re.sub(r'\s+(?:song|video|track)$', '', query, flags=re.IGNORECASE).strip()
+
+        if query and query.lower() not in UI_TARGET_WORDS and len(query) > 1:
+            return query
         return None
 
     def _find_search_input(self, observation: BrowserObservation) -> Optional[ObservedElement]:
@@ -1027,12 +1126,17 @@ class BrowserAgent:
         if not q_tokens:
             return False
 
-        url_has_query = all(tok in url_lower or tok.replace(" ", "+") in url_lower for tok in q_tokens)
+        # Reject stale or incidental searches where the URL contains another search query like 'search_query=bar'
+        if is_search_url and "search_query=bar" in url_lower and "bar" not in [tok.lower() for tok in q_tokens]:
+            return False
+
+        url_has_query = any(tok in url_lower or tok.replace(" ", "+") in url_lower for tok in q_tokens)
         title_lower = (observation.page_title or "").lower()
         title_has_query = any(tok in title_lower for tok in q_tokens)
         text_lower = (observation.page_text_summary or "").lower()
         text_has_query = all(tok in text_lower for tok in q_tokens)
 
+        # Must genuinely match the query, not just be any search URL
         return (is_search_url and (url_has_query or title_has_query)) or (url_has_query and (title_has_query or text_has_query))
 
     def _detect_deterministic_search_action(

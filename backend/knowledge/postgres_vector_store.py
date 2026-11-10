@@ -90,7 +90,14 @@ class PostgresPgVectorStore(VectorStore):
         table_name: str = "knowledge_chunks",
         in_memory: bool = False,
     ):
-        self.connection_uri = connection_uri or os.getenv("POSTGRES_URI") or os.getenv("DATABASE_URL")
+        if connection_uri:
+            self.connection_uri = connection_uri
+        else:
+            try:
+                from core.config import settings
+                self.connection_uri = getattr(settings, "POSTGRES_URI", None) or os.getenv("POSTGRES_URI") or os.getenv("DATABASE_URL")
+            except Exception:
+                self.connection_uri = os.getenv("POSTGRES_URI") or os.getenv("DATABASE_URL")
         self.embedding_provider = embedding_provider or HybridEmbeddingService()
         self.table_name = table_name
         self.in_memory = in_memory
@@ -130,6 +137,11 @@ class PostgresPgVectorStore(VectorStore):
             )
             self._is_pg_connected = False
             self._pg_conn = None
+
+    @property
+    def active_backend(self) -> str:
+        """Truthful indicator of whether Postgres/pgvector or local memory is serving vectors."""
+        return "postgres_pgvector" if self._is_pg_connected else "local_fallback"
 
     def add_chunks(self, chunks: List[DocumentChunk]) -> int:
         """

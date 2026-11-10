@@ -609,7 +609,9 @@ export default function ExecutionControl() {
                 <div className="grid grid-cols-2 gap-3">
                   <div className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-xs">
                     <span className="text-[9px] font-bold text-slate-400 uppercase tracking-wider block mb-1">Success Rate</span>
-                    <span className="text-xl font-bold text-slate-900">{(metrics?.success_rate || 0).toFixed(1)}%</span>
+                    <span className="text-xl font-bold text-slate-900">
+                      {(((metrics?.success_rate ?? 0) <= 1.0 ? (metrics?.success_rate ?? 0) * 100 : (metrics?.success_rate ?? 0))).toFixed(1)}%
+                    </span>
                   </div>
                   <div className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-xs">
                     <span className="text-[9px] font-bold text-slate-400 uppercase tracking-wider block mb-1">Avg Latency</span>
@@ -641,8 +643,10 @@ export default function ExecutionControl() {
                       <span className="font-mono bg-rose-50 text-rose-700 px-2 py-0.5 rounded font-bold">{(metrics?.tasks_failed || 0) + (metrics?.tasks_blocked || 0)}</span>
                     </div>
                     <div className="flex justify-between items-center">
-                      <span className="font-semibold text-amber-700">Retries</span>
-                      <span className="font-mono bg-amber-50 text-amber-700 px-2 py-0.5 rounded font-bold">{metrics?.tasks_retried || 0}</span>
+                      <span className="font-semibold text-amber-700">Retries / Recoveries</span>
+                      <span className="font-mono bg-amber-50 text-amber-700 px-2 py-0.5 rounded font-bold">
+                        {metrics?.tasks_retried || 0} / {(metrics as any)?.recovery_count || 0}
+                      </span>
                     </div>
                   </div>
                 </div>

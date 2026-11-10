@@ -108,6 +108,14 @@ class BrowserTask(BaseModel):
         ge=1,
         description="Maximum browser actions the agent may execute for this task",
     )
+    precondition_url: Optional[str] = Field(
+        default=None,
+        description="Expected URL before this task begins execution",
+    )
+    precondition_state: Optional[dict] = Field(
+        default=None,
+        description="Expected prerequisite browser state/postcondition from upstream tasks",
+    )
     metadata: dict = Field(default_factory=dict)
 
 
@@ -217,6 +225,10 @@ class BrowserObservation(BaseModel):
     recent_action: Optional[RecentActionRecord] = Field(
         default=None,
         description="Structured record of the most recent browser action and its outcome.",
+    )
+    media_state: Optional[List[dict]] = Field(
+        default=None,
+        description="Live state of HTML5 media elements (video/audio) on active page.",
     )
 
     def to_agent_summary(self) -> str:

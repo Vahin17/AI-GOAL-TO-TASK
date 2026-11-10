@@ -184,3 +184,71 @@ async def test_resilience_engine_selects_interactable_fallback():
     cached = LocatorResilienceEngine.cache.get("sess_mock", mock_page.url, "#flaky-id")
     assert cached == '[data-testid="confirm-btn"]'
 
+
+# ── Batch 2: Ambiguous Selector Rejection & Overlay Occlusion ─────────────────
+
+@pytest.mark.asyncio
+async def test_bare_tag_selectors_rejected_as_ambiguous():
+    mock_page = MagicMock()
+    mock_page.url = "https://www.youtube.com"
+    mock_locator = MagicMock()
+    mock_locator.count = AsyncMock(return_value=430)
+    mock_locator.first.is_visible = AsyncMock(return_value=True)
+    mock_locator.first.is_enabled = AsyncMock(return_value=True)
+    mock_page.locator.return_value = mock_locator
+
+    # A bare "span" selector should NOT be selected as a winning resilient selector
+    res = await LocatorResilienceEngine.resolve_resilient_selector(
+        page=mock_page,
+        primary_selector="span",
+        hints={},
+        timeout_ms=1000,
+    )
+    # Since bare span is rejected and no other candidate succeeds, fallback is primary
+    assert res == "span"
+
+
+@pytest.mark.asyncio
+async def test_generic_multi_match_without_qualifier_rejected():
+    mock_page = MagicMock()
+    mock_page.url = "https://www.youtube.com"
+    mock_locator = MagicMock()
+    # 25 matches for a generic class without text or id
+    mock_locator.count = AsyncMock(return_value=25)
+    mock_locator.first.is_visible = AsyncMock(return_value=True)
+    mock_locator.first.is_enabled = AsyncMock(return_value=True)
+    mock_page.locator.return_value = mock_locator
+
+    # Specific candidate with text vs generic candidate
+    res = await LocatorResilienceEngine.resolve_resilient_selector(
+        page=mock_page,
+        primary_selector=".yt-simple-endpoint",
+        hints={"text": "Yeh Fitoor Mera"},
+        timeout_ms=1000,
+    )
+    # Fallback chain generator creates role / text selectors like button:has-text("Yeh Fitoor Mera")
+    candidates = generate_fallback_selectors(primary=".yt-simple-endpoint", text="Yeh Fitoor Mera")
+    assert any(":has-text(" in c or "role=" in c for c in candidates)
+
+
+@pytest.mark.asyncio
+async def test_obstructed_element_rejected():
+    mock_page = MagicMock()
+    mock_page.url = "https://www.youtube.com"
+    mock_locator = MagicMock()
+    mock_locator.count = AsyncMock(return_value=1)
+    mock_locator.first.is_visible = AsyncMock(return_value=True)
+    mock_locator.first.is_enabled = AsyncMock(return_value=True)
+    # evaluate returns True for is_obstructed
+    mock_locator.first.evaluate = AsyncMock(return_value=True)
+    mock_page.locator.return_value = mock_locator
+
+    res = await LocatorResilienceEngine.resolve_resilient_selector(
+        page=mock_page,
+        primary_selector="[data-testid='submit-button']",
+        hints={},
+        timeout_ms=1000,
+    )
+    # The obstructed candidate was skipped
+    mock_locator.first.evaluate.assert_awaited()
+

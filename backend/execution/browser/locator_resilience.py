@@ -40,7 +40,8 @@ DEFAULT_CACHE_MAX_ENTRIES = 500
 
 def _hash_url(url: str) -> str:
     """Return compact hash of a page URL ignoring volatile query params / fragments."""
-    clean_url = url.split("#")[0].split("?")[0].rstrip("/")
+    url_str = str(url or "")
+    clean_url = url_str.split("#")[0].split("?")[0].rstrip("/")
     return hashlib.sha256(clean_url.encode("utf-8")).hexdigest()[:16]
 
 
@@ -261,9 +262,24 @@ class LocatorResilienceEngine:
 
         for candidate in candidates:
             try:
+                # 1. Reject bare generic tags without qualifiers (e.g. bare "span" matching 400+ elements)
+                is_bare_tag = candidate.strip().lower() in ("span", "div", "a", "p", "li", "button", "input", "svg", "path", "i")
+                if is_bare_tag:
+                    logger.debug(
+                        f"[LocatorResilience] Candidate '{candidate}' rejected: bare tag selector is too ambiguous."
+                    )
+                    continue
+
                 locator = page.locator(candidate)
                 count = await locator.count()
                 if count == 0:
+                    continue
+
+                # 2. Reject highly ambiguous multi-match candidates (>5 elements) lacking specific qualifiers
+                if count > 5 and not any(k in candidate for k in (":has-text(", "data-testid", "name=", "id=", "#", ":nth")):
+                    logger.debug(
+                        f"[LocatorResilience] Candidate '{candidate}' rejected: matched {count} elements without specific qualifier."
+                    )
                     continue
 
                 # Check interactability of first matching element
@@ -276,7 +292,31 @@ class LocatorResilienceEngine:
                 if not is_en:
                     continue
 
-                # Element matches, is visible, and enabled
+                # 3. Check for overlay occlusion / pointer obstruction at center point
+                is_obstructed = False
+                try:
+                    eval_res = await first_el.evaluate(
+                        """(el) => {
+                            const rect = el.getBoundingClientRect();
+                            if (rect.width === 0 || rect.height === 0) return false;
+                            const cx = rect.left + rect.width / 2;
+                            const cy = rect.top + rect.height / 2;
+                            const topEl = document.elementFromPoint(cx, cy);
+                            if (!topEl) return false;
+                            return !el.contains(topEl) && !topEl.contains(el);
+                        }"""
+                    )
+                    is_obstructed = bool(eval_res is True)
+                except Exception:
+                    is_obstructed = False
+
+                if is_obstructed:
+                    logger.debug(
+                        f"[LocatorResilience] Candidate '{candidate}' obstructed by overlay/drawer at center point. Skipping."
+                    )
+                    continue
+
+                # Element matches, is visible, enabled, and unobstructed
                 winning_selector = candidate
                 logger.info(
                     f"[LocatorResilience] Resolved selector '{winning_selector}' (count={count}) "

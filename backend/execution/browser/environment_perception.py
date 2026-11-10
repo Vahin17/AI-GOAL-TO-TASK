@@ -293,10 +293,35 @@ class EnvironmentPerceptionEngine:
         except Exception as pte:
             logger.debug(f"[EnvironmentPerceptionEngine] Page text extraction failed: {pte}")
 
+        # 4. HTML5 media elements inspection (video/audio playback status)
+        media_elements: List[Dict[str, Any]] = []
+        try:
+            media_elements = await page.evaluate(
+                """() => {
+                    try {
+                        const media = Array.from(document.querySelectorAll('video, audio')).map(m => ({
+                            tag: m.tagName.toLowerCase(),
+                            paused: Boolean(m.paused),
+                            currentTime: typeof m.currentTime === 'number' ? Math.round(m.currentTime * 10) / 10 : 0.0,
+                            duration: typeof m.duration === 'number' && !isNaN(m.duration) ? Math.round(m.duration * 10) / 10 : 0.0,
+                            readyState: typeof m.readyState === 'number' ? m.readyState : 0,
+                            muted: Boolean(m.muted),
+                            ended: Boolean(m.ended),
+                            src: m.currentSrc || m.src || ''
+                        }));
+                        return media;
+                    } catch (e) {
+                        return [];
+                    }
+                }"""
+            ) or []
+        except Exception as me:
+            logger.debug(f"[EnvironmentPerceptionEngine] Media inspection failed: {me}")
+
         duration_ms = (time.perf_counter() - t0) * 1000.0
         logger.info(
             f"[EnvironmentPerceptionEngine] Inspected page '{current_title}' ({current_url}): "
-            f"{len(elements)} interactive elements found in {duration_ms:.1f}ms."
+            f"{len(elements)} interactive elements, {len(media_elements)} media elements found in {duration_ms:.1f}ms."
         )
 
         return PageSnapshot(
@@ -309,6 +334,7 @@ class EnvironmentPerceptionEngine:
             metadata={
                 "duration_ms": duration_ms,
                 "element_count": len(elements),
+                "media_elements": media_elements,
             },
         )
 
@@ -391,6 +417,7 @@ class EnvironmentPerceptionEngine:
             observed_elements=observed_elements,
             tabs=tabs,
             recent_action=recent_action,
+            media_state=(snapshot.metadata or {}).get("media_elements") or [],
         )
 
     # ─────────────────────────────────────────────────────────────────────────

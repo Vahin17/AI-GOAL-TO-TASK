@@ -151,6 +151,13 @@ class HybridEmbeddingService:
         self._local = DeterministicLocalEmbeddingProvider(dim=128)
         self._openai: Optional[OpenAIEmbeddingProvider] = None
 
+        if api_key is None:
+            try:
+                from core.config import settings
+                api_key = getattr(settings, "OPENAI_API_KEY", None) or os.getenv("OPENAI_API_KEY")
+            except Exception:
+                api_key = os.getenv("OPENAI_API_KEY")
+
         if api_key and not force_local and not HybridEmbeddingService._openai_quota_exhausted:
             try:
                 self._openai = OpenAIEmbeddingProvider(api_key=api_key)
@@ -223,3 +230,12 @@ class HybridEmbeddingService:
     @property
     def is_using_cloud(self) -> bool:
         return self._openai is not None
+
+    @property
+    def active_provider(self) -> str:
+        """Truthful indicator of which embedding provider is actively generating vectors."""
+        if self._openai and not HybridEmbeddingService._openai_quota_exhausted:
+            return "openai"
+        if HybridEmbeddingService._openai_quota_exhausted:
+            return "local_deterministic_fallback (openai_quota_exhausted)"
+        return "local_deterministic_fallback"

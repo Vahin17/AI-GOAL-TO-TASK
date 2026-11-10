@@ -79,6 +79,7 @@ export interface SessionMetrics {
   tasks_blocked: number;
   tasks_retried: number;
   total_retry_count: number;
+  recovery_count?: number;
   reschedule_count: number;
   approval_count: number;
   throughput_per_minute: number;
