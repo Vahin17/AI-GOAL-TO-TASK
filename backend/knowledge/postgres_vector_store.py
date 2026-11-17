@@ -102,6 +102,8 @@ class PostgresPgVectorStore(VectorStore):
         self.table_name = table_name
         self.in_memory = in_memory
         self.dim = getattr(self.embedding_provider, "active_dimension", getattr(self.embedding_provider, "dimension", 128))
+        self.db_vector_dim: Optional[int] = None
+        self._has_tsv_column: bool = False
 
         # In-memory storage for test isolation / offline fallback
         self._local_chunks: Dict[str, DocumentChunk] = {}
@@ -130,13 +132,48 @@ class PostgresPgVectorStore(VectorStore):
                 cur.execute(ddl)
 
             self._is_pg_connected = True
-            logger.info(f"[PostgresPgVectorStore] Connected to PostgreSQL with pgvector (dim={self.dim}).")
+            self._inspect_db_schema()
+            logger.info(f"[PostgresPgVectorStore] Connected to PostgreSQL with pgvector (provider_dim={self.dim}, db_dim={self.db_vector_dim}).")
         except Exception as e:
             logger.warning(
                 f"[PostgresPgVectorStore] PostgreSQL connection failed ({e}). Operating in resilient local mode."
             )
             self._is_pg_connected = False
             self._pg_conn = None
+
+    def _inspect_db_schema(self) -> None:
+        """Inspects live PostgreSQL schema to determine the actual dimension of the knowledge_chunks embedding column and tsvector presence."""
+        if not self._pg_conn or not self._is_pg_connected:
+            return
+        try:
+            with self._pg_conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT format_type(atttypid, atttypmod)
+                    FROM pg_attribute
+                    WHERE attrelid = '{self.table_name}'::regclass
+                      AND attname = 'embedding'
+                      AND NOT attisdropped;
+                    """
+                )
+                row = cur.fetchone()
+                if row and row[0]:
+                    import re
+                    match = re.search(r"vector\((\d+)\)", str(row[0]))
+                    if match:
+                        self.db_vector_dim = int(match.group(1))
+
+                cur.execute(
+                    f"""
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = '{self.table_name}' AND column_name = 'tsv_content';
+                    """
+                )
+                self._has_tsv_column = bool(cur.fetchone())
+        except Exception as e:
+            logger.debug(f"[PostgresPgVectorStore] Could not introspect vector column dimension: {e}")
+        if self.db_vector_dim is None:
+            self.db_vector_dim = self.dim
 
     @property
     def active_backend(self) -> str:
@@ -160,12 +197,33 @@ class PostgresPgVectorStore(VectorStore):
         if not valid_chunks:
             return 0
 
-        # Compute embeddings for chunks that don't have them
+        # Compute embeddings for chunks that don't have them with atomic provenance
         chunks_needing_embed = [c for c in valid_chunks if not c.embedding]
         if chunks_needing_embed:
-            computed_embeddings = self.embedding_provider.embed_texts([c.content for c in chunks_needing_embed])
-            for c, emb in zip(chunks_needing_embed, computed_embeddings):
-                c.embedding = emb
+            if hasattr(self.embedding_provider, "embed_texts_with_provenance"):
+                results = self.embedding_provider.embed_texts_with_provenance([c.content for c in chunks_needing_embed])
+                for c, res in zip(chunks_needing_embed, results):
+                    c.embedding = res.vector
+                    c.metadata.setdefault("embedding_provider", res.provider)
+                    c.metadata.setdefault("embedding_model", res.model)
+                    c.metadata.setdefault("embedding_dim", res.dimension)
+                    c.metadata.setdefault("embedding_space", res.embedding_space)
+            else:
+                computed_embeddings = self.embedding_provider.embed_texts([c.content for c in chunks_needing_embed])
+                for c, emb in zip(chunks_needing_embed, computed_embeddings):
+                    c.embedding = emb
+
+        # Record fallback provenance metadata if not already populated
+        provider_name = getattr(self.embedding_provider, "active_provider", "unknown")
+        model_name = getattr(self.embedding_provider, "active_model", getattr(self.embedding_provider, "model_name", "unknown"))
+        for c in valid_chunks:
+            c.metadata.setdefault("embedding_provider", provider_name)
+            c.metadata.setdefault("embedding_model", model_name)
+            vec_len = len(c.embedding) if c.embedding else 0
+            if c.embedding:
+                c.metadata.setdefault("embedding_dim", vec_len)
+            c_space = getattr(self.embedding_provider, "embedding_space", f"{provider_name}:{model_name}:{vec_len}")
+            c.metadata.setdefault("embedding_space", c_space)
 
         if self._is_pg_connected and self._pg_conn:
             try:
@@ -193,8 +251,22 @@ class PostgresPgVectorStore(VectorStore):
                     )
 
                     # 2. Upsert chunks with pgvector embeddings
-                    chunk_rows = [
-                        (
+                    # Dimension verification: if chunk embedding dimension does not match DB column dimension,
+                    # pass None to safely persist the text and metadata while avoiding PostgreSQL 22000 dimension error.
+                    chunk_rows = []
+                    for c in valid_chunks:
+                        c_vec = c.embedding
+                        if c_vec and self.db_vector_dim is not None and len(c_vec) != self.db_vector_dim:
+                            c.metadata["embedding_stored"] = False
+                            c.metadata["embedding_dim_mismatch"] = True
+                            c_vec = None
+                            logger.warning(
+                                f"[PostgresPgVectorStore] Dimension mismatch for chunk '{c.chunk_id}': "
+                                f"generated {len(c.embedding)}-dim, DB expects {self.db_vector_dim}-dim. "
+                                f"Storing with embedding=NULL for hybrid text search."
+                            )
+
+                        chunk_rows.append((
                             c.chunk_id,
                             c.document_id,
                             c.source,
@@ -204,10 +276,8 @@ class PostgresPgVectorStore(VectorStore):
                             c.token_estimate,
                             c.content_hash,
                             json.dumps(c.metadata),
-                            c.embedding,
-                        )
-                        for c in valid_chunks
-                    ]
+                            c_vec,
+                        ))
 
                     psycopg2.extras.execute_values(
                         cur,
@@ -249,17 +319,46 @@ class PostgresPgVectorStore(VectorStore):
         if not query_text.strip():
             return []
 
-        query_vec = self.embedding_provider.embed_query(query_text)
+        if hasattr(self.embedding_provider, "embed_query_with_provenance"):
+            res = self.embedding_provider.embed_query_with_provenance(query_text)
+            query_vec = res.vector
+            vec_dim = res.dimension
+            provider_name = res.provider
+            model_name = res.model
+            query_space = res.embedding_space
+        else:
+            query_vec = self.embedding_provider.embed_query(query_text)
+            vec_dim = len(query_vec) if query_vec else 0
+            provider_name = getattr(self.embedding_provider, "active_provider", "unknown")
+            model_name = getattr(self.embedding_provider, "active_model", getattr(self.embedding_provider, "model_name", "unknown"))
+            query_space = getattr(
+                self.embedding_provider,
+                "embedding_space",
+                f"{provider_name}:{model_name}:{vec_dim}",
+            )
 
         # 1. Try PostgreSQL pgvector query if connected
         if self._is_pg_connected and self._pg_conn:
+            # Dimension pre-flight check:
+            # If query vector dimension differs from DB schema dimension,
+            # bypass pgvector distance operator to avoid aborting PostgreSQL transaction.
+            if self.db_vector_dim is not None and vec_dim != self.db_vector_dim:
+                logger.warning(
+                    f"[PostgresPgVectorStore] Query vector dimension mismatch: query={vec_dim}, DB={self.db_vector_dim}. "
+                    f"Bypassing pgvector distance operator; hybrid search will resolve candidates via full-text keyword search."
+                )
+                return []
+
             try:
                 from pgvector import Vector
                 query_vector = Vector(query_vec)
 
                 with self._pg_conn.cursor() as cur:
-                    where_clauses: List[str] = ["1=1"]
-                    filter_params: List[Any] = []
+                    where_clauses: List[str] = [
+                        "embedding IS NOT NULL",
+                        "metadata->>'embedding_space' = %s",
+                    ]
+                    filter_params: List[Any] = [query_space]
 
                     if filter_metadata:
                         for k, v in filter_metadata.items():
@@ -316,8 +415,14 @@ class PostgresPgVectorStore(VectorStore):
         # 2. Local vector search (exact cosine similarity)
         results: List[RetrievedChunk] = []
         for chunk_id, chunk in self._local_chunks.items():
+            # Strict embedding-space compatibility:
+            # Exclude records without embedding_space or with incompatible embedding_space.
+            chunk_space = chunk.metadata.get("embedding_space")
+            if not chunk_space or chunk_space != query_space:
+                continue
+
             emb = self._local_embeddings.get(chunk_id, [])
-            if not emb:
+            if not emb or len(emb) != vec_dim:
                 continue
 
             # Check metadata filter
@@ -368,8 +473,9 @@ class PostgresPgVectorStore(VectorStore):
         # 1. Try PostgreSQL full-text search if connected
         if self._is_pg_connected and self._pg_conn:
             try:
+                tsv_expr = "tsv_content" if getattr(self, "_has_tsv_column", False) else "to_tsvector('english', content)"
                 with self._pg_conn.cursor() as cur:
-                    where_clauses: List[str] = ["tsv_content @@ plainto_tsquery('english', %s)"]
+                    where_clauses: List[str] = [f"{tsv_expr} @@ plainto_tsquery('english', %s)"]
                     filter_params: List[Any] = [query_text]
 
                     if filter_metadata:
@@ -385,7 +491,7 @@ class PostgresPgVectorStore(VectorStore):
                             source,
                             content,
                             metadata,
-                            ts_rank_cd(tsv_content, plainto_tsquery('english', %s)) AS text_rank
+                            ts_rank_cd({tsv_expr}, plainto_tsquery('english', %s)) AS text_rank
                         FROM {self.table_name}
                         WHERE {where_sql}
                         ORDER BY text_rank DESC
@@ -542,6 +648,8 @@ class PostgresPgVectorStore(VectorStore):
         for item in fused_list[:top_k]:
             chunk: RetrievedChunk = item["chunk"]
             norm_score = min(1.0, item["rrf"] / max_possible_rrf)
+            if min_score > 0.0 and norm_score < min_score:
+                continue
             updated_meta = dict(chunk.metadata)
             updated_meta["retrieval_mode"] = "hybrid"
             updated_meta["rrf_score"] = round(item["rrf"], 6)

@@ -37,6 +37,7 @@ class PageElement(BaseModel):
     visible: bool = True
     enabled: bool = True
     input_type: Optional[str] = None
+    autocomplete: Optional[str] = None
 
     def get_semantic_description(self) -> str:
         """
@@ -78,6 +79,7 @@ class PageElement(BaseModel):
             "visible": self.visible,
             "enabled": self.enabled,
             "input_type": self.input_type,
+            "autocomplete": self.autocomplete,
         }
 
 

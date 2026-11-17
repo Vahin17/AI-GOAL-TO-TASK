@@ -107,15 +107,105 @@ def get_metrics_snapshot():
     return metrics_collector.get_snapshot()
 
 
+@router.get("/tools")
+def get_registered_tools():
+    """Diagnostic tool listing endpoint."""
+    from execution.registry.tool_registry import ToolRegistry
+    from execution.browser.browser_tool import BrowserTool
+    registry = ToolRegistry.get_instance()
+    if not registry.get_tool("browser"):
+        try:
+            registry.register(BrowserTool())
+        except Exception:
+            pass
+    tools = registry.list_tools()
+    return {
+        "status": "ok",
+        "total_tools": len(tools),
+        "tools": tools,
+    }
+
+
+@router.get("/orchestrate/{session_id}/inspect")
+async def inspect_session_page(
+    session_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Diagnostic endpoint returning live DOM PageSnapshot for an active browser session with strict tenant isolation."""
+    from execution.browser.environment_perception import EnvironmentPerceptionEngine
+
+    active_session = ARDOScheduler._sessions.get(session_id)
+    if not active_session or not active_session.user_id or active_session.user_id != current_user["id"]:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Forbidden: Session {session_id} not found or access denied."
+        )
+
+    page = None
+    if hasattr(active_session, "browser_adapter") and active_session.browser_adapter:
+        page = getattr(active_session.browser_adapter.executor, "_page", None)
+
+    if not page:
+        raise HTTPException(status_code=404, detail=f"No active browser page for session {session_id}")
+
+    engine = EnvironmentPerceptionEngine()
+    snapshot = await engine.inspect(page)
+    snapshot_data = snapshot.to_dict() if hasattr(snapshot, "to_dict") else snapshot.model_dump()
+
+    # Defense-in-depth: Ensure any sensitive input values in serialized snapshot elements are strictly redacted
+    import re
+    sensitive_pattern = re.compile(
+        r"password|secret|token|apikey|api_key|auth|credential|cvv|cvc|csc|cardnumber|card_number|card_no|cardno|creditcard|credit_card|debit_card|pan|ssn|social_security|socialsecurity|pin|passcode|access_token|refresh_token|bearer|private_key|privkey",
+        re.IGNORECASE,
+    )
+    sensitive_auto = re.compile(
+        r"current-password|new-password|one-time-code|cc-number|cc-csc|cc-exp|cc-exp-month|cc-exp-year|cc-type|transaction-amount",
+        re.IGNORECASE,
+    )
+    if "elements" in snapshot_data and isinstance(snapshot_data["elements"], list):
+        for el in snapshot_data["elements"]:
+            if isinstance(el, dict):
+                inp_type = str(el.get("input_type") or "").lower()
+                name = str(el.get("name") or "")
+                eid = str(el.get("element_id") or "")
+                sel = str(el.get("css_selector") or "")
+                auto = str(el.get("autocomplete") or "")
+                aria = str(el.get("aria_label") or "")
+                place = str(el.get("placeholder") or "")
+                is_sensitive = (
+                    inp_type == "password"
+                    or sensitive_pattern.search(name)
+                    or sensitive_pattern.search(eid)
+                    or sensitive_pattern.search(sel)
+                    or sensitive_pattern.search(auto)
+                    or sensitive_auto.search(auto)
+                    or sensitive_pattern.search(aria)
+                    or sensitive_pattern.search(place)
+                )
+                if is_sensitive:
+                    if el.get("value"):
+                        el["value"] = "[REDACTED]"
+
+    return {
+        "status": "active",
+        "session_id": session_id,
+        "snapshot": snapshot_data,
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Plan Generation (existing, unchanged behaviour with metrics)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.post("/plan", response_model=PlanGraphResponse)
-async def create_plan(request: GoalRequest):
+async def create_plan(
+    request: GoalRequest,
+    current_user: Optional[Dict[str, Any]] = Depends(get_optional_current_user),
+):
     """
     Generate a task graph from a natural language goal.
     Persists goal/plan/tasks to MongoDB and optionally starts ARDO.
+    Enforces tenant-isolated RAG retrieval when authenticated.
     """
     import time
     from core.metrics import metrics_collector
@@ -135,9 +225,10 @@ async def create_plan(request: GoalRequest):
         except Exception as e:
             logger.error(f"DEBUG INSERT FAILED: {e}")
 
+    user_id = current_user["id"] if current_user else None
     start_t = time.time()
     try:
-        plan = await generate_task_graph(request.goal)
+        plan = await generate_task_graph(request.goal, user_id=user_id)
         metrics_collector.record_planning(time.time() - start_t, success=True)
         return plan
     except Exception as e:
@@ -186,7 +277,7 @@ async def start_orchestration(
         )
 
     # Step 1: Generate plan
-    plan = await generate_task_graph(request.goal)
+    plan = await generate_task_graph(request.goal, user_id=user_id)
 
     # Step 2: Build session
     session_id = f"ardo_{uuid.uuid4().hex[:10]}"
@@ -263,24 +354,49 @@ async def approve_task(
     """Approve (or reject) a safety-gated task in an ARDO session with cryptographic plan hash verification and tenant isolation."""
     session = ARDOScheduler.get_session(session_id, user_id=current_user["id"])
     if not session:
-        other_session = ARDOScheduler.get_session(session_id)
-        if other_session and other_session.user_id and other_session.user_id != current_user["id"]:
-            raise HTTPException(status_code=403, detail="Cross-user approval forbidden.")
         raise HTTPException(status_code=404, detail=f"Session {session_id} not found.")
 
     if body.approved:
-        # Cryptographic plan hash validation
-        if body.plan_hash is not None:
-            expected_hash = getattr(session.graph, "plan_hash", None)
-            if expected_hash and body.plan_hash != expected_hash:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Plan hash mismatch. Provided: {body.plan_hash}, expected: {expected_hash}."
-                )
+        # Cryptographic plan hash validation (fail closed)
+        submitted_hash = (body.plan_hash or "").strip()
+        if not submitted_hash:
+            raise HTTPException(
+                status_code=400,
+                detail="Missing plan_hash. A valid cryptographic plan hash is required for task approval."
+            )
+
+        clean_session_id = str(session_id or "").strip()
+        clean_user_id = str(current_user.get("id") or "").strip()
+        if not clean_session_id or not clean_user_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Missing mandatory session or user identity for approval issuance."
+            )
+
+        # Derive authoritative expected hash directly from current live graph via canonical recomputation
+        expected_hash = None
+        if hasattr(session.graph, "recompute_plan_hash"):
+            expected_hash = session.graph.recompute_plan_hash(
+                goal_text=session.goal_id or getattr(session.graph, "goal_text", ""),
+                session_id=clean_session_id,
+                user_id=clean_user_id,
+            )
+
+        if not expected_hash or not str(expected_hash).strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Authoritative plan hash could not be determined for verification. Approval rejected."
+            )
+
+        if submitted_hash != expected_hash:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Plan hash mismatch. Provided: {submitted_hash}, expected: {expected_hash}. Plan has been modified or hash is stale."
+            )
 
         session.approve_task(task_id)
 
-        plan_hash = getattr(session.graph, "plan_hash", "") or (body.plan_hash or "")
+        plan_hash = expected_hash
         approval_id = None
         expires_at = None
         try:
@@ -354,7 +470,7 @@ async def resume_orchestration(
     """
     # 1. Tenant ownership validation on active session in memory
     active_session = ARDOScheduler._sessions.get(session_id)
-    if active_session and active_session.user_id is not None and active_session.user_id != current_user["id"]:
+    if active_session and (not active_session.user_id or active_session.user_id != current_user["id"]):
         raise HTTPException(status_code=403, detail="Cross-user resume forbidden.")
 
     # 2. Check checkpoint ownership in DB if present
@@ -366,7 +482,7 @@ async def resume_orchestration(
 
     if checkpoint:
         chk_user = checkpoint.get("user_id")
-        if chk_user is not None and chk_user != current_user["id"]:
+        if not chk_user or chk_user != current_user["id"]:
             raise HTTPException(status_code=403, detail="Cross-user resume forbidden.")
 
     worker_id = f"worker_{current_user['id'][:8]}_{uuid.uuid4().hex[:6]}"
@@ -375,6 +491,8 @@ async def resume_orchestration(
         session = await ARDOScheduler.resume(
             session_id, user_id=current_user["id"], db=db, worker_id=worker_id
         )
+    except PermissionError as pe:
+        raise HTTPException(status_code=403, detail=str(pe))
     except ValueError as ve:
         raise HTTPException(status_code=404, detail=str(ve))
     except RuntimeError as re:
@@ -634,9 +752,10 @@ def search_memories(
     top_k: int = 3,
     min_score: float = 0.35,
     memory_type: str | None = None,
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """
-    Search historical execution memories.
+    Search historical execution memories with tenant isolation.
     """
     from knowledge.rag_service import RAGService
     rag = RAGService.get_instance()
@@ -647,6 +766,7 @@ def search_memories(
         top_k=top_k,
         min_score=min_score,
         memory_type=memory_type,
+        user_id=current_user["id"],
     )
     return [m.model_dump() for m in memories]
 
@@ -771,8 +891,9 @@ async def orchestration_websocket(websocket: WebSocket, session_id: str):
         await websocket.close(code=1008)
         return
 
-    active_session = ARDOScheduler._sessions.get(session_id)
-    if active_session and active_session.user_id is not None and active_session.user_id != user_id:
+    active_session = ARDOScheduler.get_session(session_id, user_id=user_id)
+    if not active_session:
+        logger.warning(f"[WS] Rejecting connection: session {session_id} not active or not owned by user {user_id}")
         await websocket.close(code=1008)
         return
 
@@ -780,7 +901,7 @@ async def orchestration_websocket(websocket: WebSocket, session_id: str):
     logger.info(f"[WS] Client connected to session: {session_id} (user={user_id})")
 
     try:
-        async for event_dict in ARDOScheduler.stream_events(session_id):
+        async for event_dict in ARDOScheduler.stream_events(session_id, user_id=user_id):
             await websocket.send_json(event_dict)
             if event_dict.get("event_type") in ("session_complete", "session_failed"):
                 break

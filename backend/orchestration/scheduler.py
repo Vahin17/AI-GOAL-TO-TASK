@@ -56,6 +56,13 @@ class ARDOSession:
         self.worker_id = worker_id
         self._is_cleaned_up: bool = False
 
+        # Bind session_id and user_id to graph for cryptographic plan hashing & isolation
+        if self.graph:
+            if not getattr(self.graph, "session_id", None) or self.graph.session_id.startswith("ardo_"):
+                self.graph.session_id = session_id
+            if user_id and not getattr(self.graph, "user_id", None):
+                self.graph.user_id = user_id
+
         # 1. Create dedicated session-scoped ToolRegistry (isolated from other sessions)
         from execution.registry.tool_registry import ToolRegistry
         global_registry = ToolRegistry.get_instance()
@@ -130,6 +137,12 @@ class ARDOSession:
             return
         self._is_cleaned_up = True
         logger.info(f"[ARDOSession] Cleaning up session {self.session_id} resources.")
+        if self._task is not None and not self._task.done() and asyncio.current_task() != self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):
+                pass
         if hasattr(self, "engine") and self.engine is not None:
             await self.engine.cleanup()
         elif self.browser_adapter and hasattr(self.browser_adapter, "executor") and self.browser_adapter.executor:
@@ -138,7 +151,7 @@ class ARDOSession:
                     timeout_sec = getattr(settings, "BROWSER_INSPECTION_TIMEOUT_SECONDS", 120)
                     logger.info(f"[ARDOSession] BROWSER_INSPECTION_MODE: preserving browser for {timeout_sec}s.")
                     await asyncio.sleep(timeout_sec)
-                if getattr(self.browser_adapter.executor, "is_running", False):
+                if hasattr(self.browser_adapter.executor, "stop"):
                     await self.browser_adapter.executor.stop()
             except Exception as e:
                 logger.warning(f"[ARDOSession] Browser executor cleanup error for session {self.session_id}: {e}")
@@ -161,6 +174,17 @@ class ARDOSession:
 
         self._task = asyncio.create_task(_run())
         logger.info(f"[ARDOSession] Session {self.session_id} started.")
+
+    async def pause(self, reason: str = "manual", cooldown_seconds: float = 0.0) -> None:
+        """Pauses the underlying runtime engine cleanly."""
+        if hasattr(self, "engine") and self.engine is not None:
+            await self.engine.pause(reason=reason, cooldown_seconds=cooldown_seconds)
+
+    def resume(self) -> bool:
+        """Resumes the underlying runtime engine if eligible."""
+        if hasattr(self, "engine") and self.engine is not None:
+            return self.engine.resume()
+        return False
 
     def approve_task(self, task_id: str) -> None:
         self.engine.approve_task(task_id)
@@ -365,10 +389,23 @@ class ARDOScheduler:
         if existing and getattr(existing.engine, "_is_running", False):
             raise RuntimeError(f"Session {session_id} is already actively running.")
 
-        # 2. Load latest checkpoint
+        # 2. Enforce strict caller identity and checkpoint ownership (fail closed)
+        clean_user = str(user_id).strip() if user_id is not None else ""
+        if not clean_user:
+            raise ValueError(f"Authenticated user_id is required to resume session {session_id}.")
+
         checkpoint = await ExecutionCheckpointManager.load_latest_checkpoint(session_id, db=db)
         if not checkpoint:
             raise ValueError(f"No execution checkpoint found for session {session_id}")
+
+        chk_user = str(checkpoint.get("user_id") or "").strip()
+        if not chk_user or chk_user != clean_user:
+            raise PermissionError(f"Cross-user checkpoint resume forbidden: checkpoint owned by '{chk_user}', requested by '{clean_user}'")
+
+        if existing:
+            existing_user = str(existing.user_id or "").strip()
+            if not existing_user or existing_user != clean_user:
+                raise PermissionError(f"Cross-user session resume forbidden: session owned by '{existing_user}', requested by '{clean_user}'")
 
         # 3. Reconstruct or retrieve graph
         if existing and hasattr(existing, "graph"):
@@ -426,14 +463,34 @@ class ARDOScheduler:
 
     @classmethod
     def get_session(cls, session_id: str, user_id: Optional[str] = None) -> Optional[ARDOSession]:
+        """
+        Retrieve an active ARDOSession enforcing strict tenant ownership isolation (fail closed).
+        - Missing, empty, or whitespace-only caller identity is denied.
+        - Missing, empty, or whitespace-only session owner is denied.
+        - Identity mismatch between caller and session owner is denied.
+        - Only matching authenticated tenant identity is granted access.
+        """
         session = cls._sessions.get(session_id)
         if not session:
             return None
-        # Enforce multi-user data isolation
-        if user_id is not None and session.user_id is not None and session.user_id != user_id:
-            logger.warning(f"[Security] User {user_id} attempted unauthorized access to session {session_id} owned by {session.user_id}")
+        # Enforce multi-user data isolation (fail closed)
+        clean_user = str(user_id).strip() if user_id is not None else ""
+        clean_owner = str(session.user_id or "").strip()
+        if not clean_user or not clean_owner or clean_owner != clean_user:
+            logger.warning(
+                f"[Security] Access denied for session {session_id}: caller='{user_id}', "
+                f"owner='{session.user_id}'"
+            )
             return None
         return session
+
+    @classmethod
+    def get_session_internal(cls, session_id: str) -> Optional[ARDOSession]:
+        """
+        Trusted internal system-only lookup for background sweeps and engine management.
+        Never expose to caller-controlled API endpoints or external input.
+        """
+        return cls._sessions.get(session_id)
 
     @classmethod
     def get_state(cls, session_id: str, user_id: Optional[str] = None) -> Optional[dict]:
@@ -453,6 +510,43 @@ class ARDOScheduler:
         if user_id is not None:
             return [sid for sid, s in cls._sessions.items() if s.user_id == user_id]
         return list(cls._sessions.keys())
+
+    @classmethod
+    async def pause_session(
+        cls,
+        session_id: str,
+        reason: str = "manual",
+        cooldown_seconds: float = 0.0,
+        user_id: Optional[str] = None,
+    ) -> bool:
+        """Safely pauses an active session and saves an authoritative checkpoint."""
+        session = cls.get_session(session_id, user_id=user_id)
+        if not session:
+            return False
+        await session.pause(reason=reason, cooldown_seconds=cooldown_seconds)
+        return True
+
+    @classmethod
+    def resume_paused_session(cls, session_id: str, user_id: Optional[str] = None) -> bool:
+        """Unpauses an in-memory paused session if its cooldown period has elapsed with strict fail-closed ownership."""
+        clean_user = str(user_id).strip() if user_id is not None else ""
+        if not clean_user:
+            logger.warning(f"[Security] Denied attempt to resume paused session {session_id} without valid user_id.")
+            return False
+
+        session = cls._sessions.get(session_id)
+        if not session:
+            return False
+
+        clean_owner = str(session.user_id or "").strip()
+        if not clean_owner or clean_owner != clean_user:
+            logger.warning(
+                f"[Security] Denied attempt to resume paused session {session_id}: "
+                f"caller '{clean_user}' != session owner '{clean_owner}'."
+            )
+            return False
+
+        return session.resume()
 
     @classmethod
     async def stop_session(cls, session_id: str, user_id: Optional[str] = None) -> bool:
@@ -493,21 +587,26 @@ class ARDOScheduler:
 
         for sid in abandoned_ids:
             logger.info(f"[ARDOScheduler] Evicting abandoned/expired session: {sid}")
-            await cls.stop_session(sid)
+            session = cls.get_session_internal(sid)
+            if session:
+                cls._sessions.pop(sid, None)
+                if session._task is not None and not session._task.done():
+                    session._task.cancel()
+                await session.cleanup()
 
         return len(abandoned_ids)
 
     @classmethod
     async def stream_events(
-        cls, session_id: str
+        cls, session_id: str, user_id: Optional[str] = None
     ) -> AsyncGenerator[dict, None]:
         """
         WebSocket event generator for a session.
         Yields events as JSON-serialisable dicts.
         """
-        session = cls.get_session(session_id)
+        session = cls.get_session(session_id, user_id=user_id)
         if not session:
-            yield {"error": f"Session {session_id} not found"}
+            yield {"error": f"Session {session_id} not found or access denied"}
             return
 
         q = session.subscribe()

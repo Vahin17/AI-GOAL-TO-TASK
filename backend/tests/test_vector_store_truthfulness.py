@@ -35,6 +35,9 @@ def test_semantic_memory_store_picks_up_settings_postgres_uri():
 
 
 def test_hybrid_embedding_service_truthful_active_provider():
+    # Reset any prior test leak
+    HybridEmbeddingService._openai_quota_exhausted = False
+
     # Force local mode
     local_service = HybridEmbeddingService(force_local=True)
     assert local_service.active_provider == "local_deterministic_fallback"
@@ -51,7 +54,7 @@ def test_hybrid_embedding_service_truthful_active_provider():
 
 
 def test_playbook_service_rejects_unverified_candidate_promotion():
-    auth_db = AuthDatabase.get_instance()
+    auth_db = AuthDatabase.get_instance(force_sqlite=True)
     
     # Ensure a valid test user exists in PostgreSQL to satisfy foreign key constraint
     test_user = auth_db.get_user_by_email("test_pb_user@example.com")

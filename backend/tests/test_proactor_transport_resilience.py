@@ -48,3 +48,61 @@ async def test_proactor_worker_sequential_dispatch():
     )
     assert results == [2, 4, 6]
 
+
+@pytest.mark.asyncio
+async def test_proactor_worker_cancellation_hang_marks_unhealthy_and_recovers(monkeypatch):
+    import execution.browser.playwright_executor as pe
+    monkeypatch.setattr(pe, "PLAYWRIGHT_TEARDOWN_TIMEOUT_SECONDS", 0.1)
+
+    # Ensure clean worker
+    pe._ProactorWorker.reset_instance()
+    worker = pe._ProactorWorker.get()
+    assert worker.is_healthy is True
+
+    hang_event = asyncio.Event()
+
+    async def hanging_coro():
+        # Never finishes, simulating hung CDP/pipe transport
+        await hang_event.wait()
+        return "never"
+
+    task = asyncio.create_task(worker.run(hanging_coro()))
+    await asyncio.sleep(0.02)
+    task.cancel()
+
+    # 1. Cancellation propagates to caller within bounded timeout
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # 2. Worker is marked unhealthy and diagnostics recorded
+    assert worker.is_healthy is False
+    assert worker.timeout_count >= 1
+    assert "last_cancellation_error" in worker.diagnostics
+
+    # 3. New operations are rejected on unhealthy worker
+    dummy_coro = asyncio.sleep(0.01)
+    try:
+        with pytest.raises(RuntimeError, match="unhealthy"):
+            await worker.run(dummy_coro)
+    finally:
+        dummy_coro.close()
+        hang_event.set()
+
+    # 4. Replacement worker recovers after reset_instance()
+    pe._ProactorWorker.reset_instance()
+    fresh_worker = pe._ProactorWorker.get()
+    assert fresh_worker.is_healthy is True
+    res = await fresh_worker.run(asyncio.sleep(0.01, result="recovered"))
+    assert res == "recovered"
+
+
+@pytest.mark.asyncio
+async def test_playwright_executor_repeated_stop_is_safe():
+    from execution.browser.playwright_executor import PlaywrightBrowserExecutor
+    executor = PlaywrightBrowserExecutor()
+    # Repeated calls before or after start must be safe and idempotent
+    await executor.stop()
+    await executor.stop()
+    assert executor.is_running is False
+
+

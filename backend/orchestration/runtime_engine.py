@@ -80,6 +80,7 @@ class RuntimeEngine:
         browser_agent: Optional[Any] = None,
         user_id: Optional[str] = None,
         worker_id: Optional[str] = None,
+        max_approval_wait_ticks: Optional[int] = None,
     ):
         self.graph = graph
         self.session_id = session_id
@@ -90,6 +91,7 @@ class RuntimeEngine:
         self.worker_id = worker_id or f"worker_{uuid.uuid4().hex[:12]}"
         self.browser_adapter = browser_adapter
         self._browser_agent = browser_agent
+        self.max_approval_wait_ticks = max_approval_wait_ticks
         self._is_cleaned_up: bool = False
 
         # Phase 2: Worker Lease & Heartbeat State
@@ -138,6 +140,10 @@ class RuntimeEngine:
         # Idempotency / lifecycle guard
         self._is_running = False
         self._is_completed = False
+        self._is_paused = False
+        self._pause_reason: Optional[str] = None
+        self._pause_cooldown: float = 0.0
+        self._pause_time: float = 0.0
 
     async def _lease_heartbeat_loop(self, interval_seconds: float = 5.0, lease_duration: float = 30.0) -> None:
         """
@@ -245,7 +251,7 @@ class RuntimeEngine:
         if any(verb in label_lower for verb in (
             "navigate", "visit", "browse", "click", "fill", "extract",
             "screenshot", "scroll", "page", "tab", "search", "http://", "https://",
-            "open", "wikipedia", "youtube", "google", "website"
+            "open", "wikipedia", "youtube", "google", "website", "update", "edit"
         )):
             return True
         if re.search(r'\b(?:open|load|close|switch to)\s+(?:a\s+)?(?:new\s+)?(?:tab|page|browser|website|url|site)\b', label_lower):
@@ -280,7 +286,7 @@ class RuntimeEngine:
                         )
                         await asyncio.sleep(timeout_sec)
 
-                if getattr(executor, "is_running", False):
+                if hasattr(executor, "stop"):
                     await executor.stop()
             except Exception as e:
                 logger.warning(f"[RuntimeEngine] Session {self.session_id} browser stop error: {e}")
@@ -350,6 +356,21 @@ class RuntimeEngine:
 
             while iteration < max_iterations:
                 iteration += 1
+
+                # Check for explicit execution pause (e.g. provider recovery or operator pause)
+                if self._is_paused:
+                    logger.info(f"[RuntimeEngine] Session {self.session_id} is paused (reason: {self._pause_reason}).")
+                    yield OrchestrationEvent(
+                        event_type="session_paused",
+                        session_id=self.session_id,
+                        status="paused",
+                        details={
+                            "reason": self._pause_reason,
+                            "cooldown_seconds": self._pause_cooldown,
+                            "checkpoint_saved": True,
+                        },
+                    )
+                    return
 
                 # Split-brain check: if lease was revoked or expired, suspend task dispatch immediately
                 if not self._lease_valid:
@@ -458,7 +479,8 @@ class RuntimeEngine:
                             self._approval_wait_ticks = getattr(self, "_approval_wait_ticks", 0) + 1
                             max_ticks = getattr(self, "max_approval_wait_ticks", None)
                             if max_ticks is None:
-                                max_ticks = 10 if os.getenv("PYTEST_CURRENT_TEST") else 600
+                                timeout_secs = float(getattr(settings, "APPROVAL_WAIT_MAX_SECONDS", 60.0))
+                                max_ticks = max(1, int(timeout_secs / 0.5))
                             if self._approval_wait_ticks >= max_ticks:
                                 logger.info("[RuntimeEngine] Awaiting approval timeout reached without input. Ending run loop.")
                                 return
@@ -535,12 +557,54 @@ class RuntimeEngine:
         # ── Phase 2: Cryptographic Plan Approval Binding Verification ──
         was_gated = getattr(node, "was_approval_gated", False) or "Operator approved." in "".join(node.execution_logs)
         if was_gated:
-            current_plan_hash = self.graph.recompute_plan_hash(self.goal_id)
+            clean_session_id = str(self.session_id or "").strip()
+            clean_user_id = str(self.user_id or getattr(self.graph, "user_id", None) or "").strip()
+
+            if not clean_session_id or not clean_user_id:
+                reason = "Cryptographic approval verification failed: missing mandatory session or user identity."
+                logger.error(f"[RuntimeEngine] {reason} (session={self.session_id}, task={task_id})")
+                self._quarantine_branch(task_id, reason)
+                yield OrchestrationEvent(
+                    event_type="task_approval_invalidated",
+                    session_id=self.session_id,
+                    task_id=task_id,
+                    task_name=node.task_name,
+                    status="failed",
+                    details={"reason": reason},
+                )
+                return
+
+            current_plan_hash = None
+            if hasattr(self.graph, "recompute_plan_hash"):
+                try:
+                    current_plan_hash = self.graph.recompute_plan_hash(
+                        goal_text=self.goal_id,
+                        session_id=clean_session_id,
+                        user_id=clean_user_id,
+                    )
+                except Exception as e:
+                    logger.error(f"[RuntimeEngine] Authoritative plan hash recomputation failed: {e}")
+                    current_plan_hash = None
+
+            if not current_plan_hash or not str(current_plan_hash).strip():
+                reason = "Cryptographic approval verification failed: authoritative plan hash recomputation failed."
+                logger.error(f"[RuntimeEngine] {reason} (session={self.session_id}, task={task_id})")
+                self._quarantine_branch(task_id, reason)
+                yield OrchestrationEvent(
+                    event_type="task_approval_invalidated",
+                    session_id=self.session_id,
+                    task_id=task_id,
+                    task_name=node.task_name,
+                    status="failed",
+                    details={"reason": reason},
+                )
+                return
+
             from core.auth_db import AuthDatabase
             try:
                 auth_db = AuthDatabase.get_instance()
                 is_approved = auth_db.is_plan_approved(
-                    session_id=self.session_id,
+                    session_id=clean_session_id,
                     plan_hash=current_plan_hash,
                     task_id=task_id,
                 )
@@ -845,10 +909,12 @@ class RuntimeEngine:
                                 dep_url = None
                                 if dep_res and getattr(dep_res, "verification", None):
                                     dep_url = getattr(dep_res.verification, "observed_url", None)
-                                if not dep_url and dep_res and getattr(dep_res, "observation", None):
-                                    dep_url = getattr(dep_res.observation, "current_url", None)
+                                if not dep_url and dep_res:
+                                    dep_url = getattr(dep_res, "final_url", None)
+                                if not dep_url and isinstance(dep_post, dict):
+                                    dep_url = dep_post.get("url")
                                 if not dep_url:
-                                    dep_url = dep_post.get("url") or dep_meta.get("destination_url") or dep_meta.get("expected_url")
+                                    dep_url = dep_meta.get("destination_url") or dep_meta.get("expected_url")
 
                                 if dep_url and not precondition_url:
                                     precondition_url = dep_url
@@ -931,15 +997,23 @@ class RuntimeEngine:
                     # Record verified postcondition state for dependent tasks
                     post_url = None
                     post_title = None
-                    if agent_res.verification:
-                        post_url = getattr(agent_res.verification, "observed_url", None)
-                        post_title = getattr(agent_res.verification, "observed_title", None)
-                    if not post_url and agent_res.observation:
-                        post_url = getattr(agent_res.observation, "current_url", None)
-                        post_title = getattr(agent_res.observation, "page_title", None)
+                    is_verified = False
+                    verif = getattr(agent_res, "verification", None)
+                    if verif is not None:
+                        post_url = getattr(verif, "observed_url", None)
+                        post_title = getattr(verif, "observed_title", None)
+                        from execution.browser.agent_contracts import BrowserVerificationStatus
+                        if getattr(verif, "status", None) == BrowserVerificationStatus.VERIFIED:
+                            is_verified = True
+                    if not post_url:
+                        post_url = getattr(agent_res, "final_url", None)
+                    if not post_title:
+                        post_title = getattr(agent_res, "final_title", None)
+
                     node.metadata["postcondition"] = {
                         "url": post_url,
                         "title": post_title,
+                        "verified": is_verified,
                         "verified_at": time.time(),
                     }
                     return True
@@ -1309,6 +1383,7 @@ class RuntimeEngine:
                         self.graph,
                         trigger=f"task_{outcome}",
                         db=getattr(self.monitor, "db", None),
+                        user_id=self.user_id,
                     )
                 )
         except Exception as e:
@@ -1403,11 +1478,26 @@ class RuntimeEngine:
             completed_count = sum(1 for n in tasks if n.status == TaskState.COMPLETED)
             failed_count = sum(1 for n in tasks if n.status == TaskState.FAILED)
             blocked_count = sum(1 for n in tasks if n.status == TaskState.BLOCKED)
+            outcome_unknown_count = sum(1 for n in tasks if n.status == TaskState.OUTCOME_UNKNOWN)
 
-            if failed_count > 0:
+            # Strict Semantic Memory Invariant: A plan can ONLY be recorded as "success" if
+            # ALL tasks completed, zero failures, zero blocks, and goal outcome was verified.
+            # Incomplete runs or provider-failure aborts must NEVER record successful memories.
+            goal_verif = getattr(self, "_goal_verification", None)
+            goal_verif_status = getattr(goal_verif, "overall_status", "") if goal_verif else ""
+
+            if getattr(self, "_is_paused", False):
+                outcome_status = "paused"
+            elif failed_count > 0 or goal_verif_status in ("failed", "rejected"):
                 outcome_status = "failed"
+            elif outcome_unknown_count > 0:
+                outcome_status = "outcome_unknown"
             elif blocked_count > 0 and completed_count == 0:
                 outcome_status = "blocked"
+            elif completed_count < len(tasks):
+                outcome_status = "incomplete"
+            elif goal_verif_status and goal_verif_status != "verified":
+                outcome_status = "unverified"
             else:
                 outcome_status = "success"
 
@@ -1430,12 +1520,62 @@ class RuntimeEngine:
                 task_summary=summary_str,
                 execution_metrics=metrics,
                 safety_summary={"blocked_count": blocked_count},
+                user_id=self.user_id,
             )
             logger.info(f"[RuntimeEngine] Recorded session {self.session_id} outcome ({outcome_status}) to Semantic Memory.")
         except Exception as e:
             logger.warning(f"[RuntimeEngine] Semantic memory persistence note: {e}")
 
-    # ── Public State Access ────────────────────────────────────────────────
+    # ── Public State & Lifecycle Access ────────────────────────────────────
+
+    @property
+    def is_paused(self) -> bool:
+        """Returns True if the session execution loop is paused."""
+        return self._is_paused
+
+    async def pause(self, reason: str = "manual", cooldown_seconds: float = 0.0) -> None:
+        """
+        Safely pauses execution, persists an authoritative checkpoint, and signals loop stop.
+        """
+        self._is_paused = True
+        self._pause_reason = reason
+        self._pause_cooldown = cooldown_seconds
+        self._pause_time = time.time()
+        logger.info(
+            f"[RuntimeEngine] Pausing session {self.session_id} (reason: {reason}, "
+            f"cooldown: {cooldown_seconds:.1f}s)..."
+        )
+        try:
+            from orchestration.checkpoint_manager import ExecutionCheckpointManager
+            await ExecutionCheckpointManager.save_checkpoint(
+                session_id=self.session_id,
+                graph=self.graph,
+                trigger=f"pause_{reason}",
+                metadata={"cooldown_seconds": cooldown_seconds, "pause_reason": reason},
+                db=self.db,
+                user_id=self.user_id,
+            )
+        except Exception as e:
+            logger.warning(f"[RuntimeEngine] Checkpoint save during pause note: {e}")
+
+    def resume(self) -> bool:
+        """
+        Unpauses the session if cooldown period has elapsed.
+        Returns True if unpaused, False if still within cooldown.
+        """
+        now = time.time()
+        if self._pause_cooldown > 0.0:
+            elapsed = now - getattr(self, "_pause_time", 0.0)
+            if elapsed < self._pause_cooldown:
+                logger.info(
+                    f"[RuntimeEngine] Resume deferred: cooldown remaining {self._pause_cooldown - elapsed:.1f}s"
+                )
+                return False
+        self._is_paused = False
+        self._pause_reason = None
+        self._pause_cooldown = 0.0
+        logger.info(f"[RuntimeEngine] Session {self.session_id} resumed from pause.")
+        return True
 
     def get_goal_verification(self) -> Optional[Any]:
         """Returns or computes the session goal outcome verification."""

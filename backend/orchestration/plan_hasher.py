@@ -79,9 +79,12 @@ def compute_plan_hash(
     nodes: Union[List[TaskNode], List[Dict[str, Any]], List[Any]],
     edges: Union[List[TaskEdge], List[Dict[str, Any]], List[Any]],
     intent: Optional[str] = None,
+    session_id: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> str:
     """
     Computes a deterministic canonical SHA-256 hash for a given plan DAG.
+    When session_id or user_id are provided, cryptographically binds the hash to that session and owner.
     """
     # 1. Canonicalize and sort nodes by ID
     canon_nodes = [_extract_node_canonical(n) for n in nodes]
@@ -92,11 +95,15 @@ def compute_plan_hash(
     canon_edges.sort(key=lambda e: (e["source"], e["target"]))
 
     # 3. Canonical representation dictionary
-    canonical_repr = {
+    canonical_repr: Dict[str, Any] = {
         "intent": (intent or "").strip(),
         "nodes": canon_nodes,
         "edges": canon_edges,
     }
+    if session_id and str(session_id).strip():
+        canonical_repr["session_id"] = str(session_id).strip()
+    if user_id and str(user_id).strip():
+        canonical_repr["user_id"] = str(user_id).strip()
 
     # 4. Serialize with strict key sorting, no whitespace padding, utf-8
     canonical_json = json.dumps(

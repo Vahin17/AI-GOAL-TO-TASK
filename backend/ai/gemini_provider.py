@@ -98,13 +98,12 @@ def _parse_error_body(status_code: int, headers: dict, raw_bytes: bytes) -> Tupl
     retry_after: Optional[float] = None
     is_permanent_quota = False
 
+    from core.retry_utils import parse_retry_after, classify_provider_error
+
     # 1. Check HTTP Retry-After header
     header_retry = headers.get("Retry-After") or headers.get("retry-after")
     if header_retry:
-        try:
-            retry_after = float(str(header_retry).strip().rstrip("s"))
-        except (ValueError, TypeError):
-            pass
+        retry_after = parse_retry_after(header_retry)
 
     # 2. Parse JSON response body if present
     parsed_details = []
@@ -133,13 +132,10 @@ def _parse_error_body(status_code: int, headers: dict, raw_bytes: bytes) -> Tupl
                     if isinstance(d, dict):
                         # RetryInfo e.g. {"@type": "...RetryInfo", "retryDelay": "51.236756038s"}
                         if "retryDelay" in d:
-                            delay_str = str(d["retryDelay"]).strip().rstrip("s")
-                            try:
-                                delay_val = float(delay_str)
-                                if retry_after is None or delay_val > retry_after:
-                                    retry_after = delay_val
-                            except (ValueError, TypeError):
-                                pass
+                            parsed_delay = parse_retry_after(d["retryDelay"])
+                            if parsed_delay is not None:
+                                if retry_after is None or parsed_delay > retry_after:
+                                    retry_after = parsed_delay
 
                         reason = str(d.get("reason", "")).upper()
                         metadata = d.get("metadata", {}) if isinstance(d.get("metadata"), dict) else {}
@@ -165,16 +161,15 @@ def _parse_error_body(status_code: int, headers: dict, raw_bytes: bytes) -> Tupl
                 pass
 
     # 4. Quota permanence determination:
-    if is_permanent_quota:
+    failure_type, is_perm = classify_provider_error(status_code, error_msg, parsed_details)
+    if is_perm:
+        is_permanent_quota = True
+    elif is_permanent_quota:
         pass
     elif retry_after is not None and retry_after > 0:
         is_permanent_quota = False
     elif status_code == 429:
-        msg_lower = error_msg.lower()
-        if any(k in msg_lower for k in ("daily", "per day", "billing", "plan and billing details", "check quota")):
-            is_permanent_quota = True
-        else:
-            is_permanent_quota = False
+        is_permanent_quota = is_perm
 
     error_msg = _redact_sensitive(error_msg)
     return error_msg, error_status, retry_after, is_permanent_quota

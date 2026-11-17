@@ -54,22 +54,16 @@ class GeminiSharedRateLimiter:
     _init_lock: asyncio.Lock = asyncio.Lock()
 
     def __init__(self, rpm: Optional[int] = None, window_seconds: float = 60.0):
-        import os
         from core.config import settings
         if rpm is not None:
             self.rpm = rpm
             self.window_seconds = window_seconds
-        elif os.getenv("PYTEST_CURRENT_TEST"):
-            # High throughput during automated test suites unless explicitly tested with custom RPM
-            self.rpm = getattr(settings, "GEMINI_TEST_RPM_LIMIT", 1000)
-            self.window_seconds = 1.0
         else:
             self.rpm = getattr(settings, "GEMINI_RPM_LIMIT", 4)
             self.window_seconds = window_seconds
         self._timestamps: List[float] = []
         self._blocked_until: float = 0.0
         self._lock: asyncio.Lock = asyncio.Lock()
-        self._last_test_id: Optional[str] = os.getenv("PYTEST_CURRENT_TEST")
         logger.info(
             f"[GeminiRateLimiter] Initialized shared rate limiter: RPM={self.rpm}, window={self.window_seconds}s"
         )
@@ -83,6 +77,13 @@ class GeminiSharedRateLimiter:
             cls._instance.rpm = rpm
         return cls._instance
 
+    @classmethod
+    def reset_instance(cls) -> None:
+        """Resets the process-wide singleton limiter instance."""
+        if cls._instance is not None:
+            cls._instance.reset()
+        cls._instance = None
+
     async def acquire(self, timeout: Optional[float] = None) -> float:
         """
         Acquires a request slot under the sliding-window budget.
@@ -94,16 +95,9 @@ class GeminiSharedRateLimiter:
         Raises:
             GeminiRateLimitError: If total required wait time exceeds `timeout`.
         """
-        import os
         total_waited = 0.0
 
         async with self._lock:
-            # Isolate tests in pytest harness so state does not leak across test cases
-            current_test = os.getenv("PYTEST_CURRENT_TEST")
-            if current_test and current_test != getattr(self, "_last_test_id", None):
-                self._last_test_id = current_test
-                self.reset()
-
             while True:
                 now = time.monotonic()
 

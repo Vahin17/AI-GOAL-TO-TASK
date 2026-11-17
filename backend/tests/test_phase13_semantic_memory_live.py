@@ -23,6 +23,8 @@ load_dotenv()
 
 from knowledge.semantic_memory import SemanticMemoryStore, ExecutionMemoryItem
 
+pytestmark = pytest.mark.live_db
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -34,7 +36,8 @@ def live_store():
     Instantiate a SemanticMemoryStore that MUST connect to live PostgreSQL.
     Skips the entire module if the live DB is unavailable.
     """
-    store = SemanticMemoryStore()
+    from knowledge.embeddings import HybridEmbeddingService
+    store = SemanticMemoryStore(embedding_provider=HybridEmbeddingService(force_local=True))
     if not store._is_pg_connected:
         pytest.skip(
             "Live PostgreSQL is not available -- skipping live semantic-memory "
@@ -266,7 +269,8 @@ def test_phase13_semantic_memory_live_summary(live_store, test_phrase):
     same_results = live_store.retrieve_memories(test_phrase, top_k=1000, min_score=0.0)
     same_found = any(r.memory_id == memory_id for r in same_results)
 
-    sm3 = SemanticMemoryStore()
+    from knowledge.embeddings import HybridEmbeddingService
+    sm3 = SemanticMemoryStore(embedding_provider=HybridEmbeddingService(force_local=True))
     new_results = sm3.retrieve_memories(test_phrase, top_k=1000, min_score=0.0)
     new_found = any(r.memory_id == memory_id for r in new_results)
 

@@ -114,10 +114,16 @@ class SessionMetrics:
 
     @property
     def success_rate(self) -> float:
+        """Returns task completion ratio in range [0.0, 1.0]."""
         total = self.tasks_total if self.tasks_total > 0 else (self.tasks_completed + self.tasks_failed)
         if total == 0:
             return 0.0
         return round(self.tasks_completed / total, 3)
+
+    @property
+    def success_rate_percentage(self) -> float:
+        """Returns task completion percentage in range [0.0, 100.0]."""
+        return round(self.success_rate * 100.0, 1)
 
     def add_timeline_marker(
         self, marker_type: str, task_id: str, task_name: str, **extra
@@ -149,6 +155,7 @@ class SessionMetrics:
             "throughput_per_minute": self.throughput_per_minute,
             "avg_latency_seconds": self.avg_latency_seconds,
             "success_rate": self.success_rate,
+            "success_rate_percentage": self.success_rate_percentage,
             "scheduler_efficiency_score": self.scheduler_efficiency_score,
             "parallelization_utilization_ratio": self.parallelization_utilization_ratio,
             "average_dependency_wait_duration": self.average_dependency_wait_duration,

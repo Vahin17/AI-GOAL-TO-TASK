@@ -133,3 +133,90 @@ def test_goal_outcome_confidence_not_hardcoded_to_95():
     # Previously was hardcoded to 0.95! Now must accurately reflect aggregate ~0.70!
     assert goal_res.confidence_score == 0.70
     assert "0.95" not in str(goal_res.confidence_score)
+
+
+def test_playback_intent_detection_negative_cases():
+    """
+    Terms containing 'play' as substrings or distinct nouns like 'display',
+    'playlist', 'google play', 'play store', 'playwright', 'coldplay',
+    must NOT trigger media playback verification.
+    """
+    cases = [
+        "Display the search results for query",
+        "Open my favorite playlist",
+        "Navigate to Google Play store to view apps",
+        "Download app from play store",
+        "Run playwright automated test",
+        "Look at the gameplay video screenshots",
+        "Roleplay forum discussion",
+        "Search for Coldplay concert dates",
+    ]
+    for text in cases:
+        task = BrowserTask(task_id="t_test", objective=text, session_id="s1")
+        assert SemanticVerifier._has_playback_intent(task) is False, f"False positive playback intent for: {text}"
+
+
+def test_playback_intent_detection_positive_cases():
+    """
+    Explicit playback objectives must trigger media playback verification.
+    """
+    cases = [
+        "Play song Yeh Fitoor Mera",
+        "Play the video on YouTube",
+        "Search YouTube for Vande Mataram and play the song",
+        "Start playing audio track",
+        "Ensure media playback is active",
+        "Listen to music album",
+        "Play the music video",
+    ]
+    for text in cases:
+        task = BrowserTask(task_id="t_test", objective=text, session_id="s1")
+        assert SemanticVerifier._has_playback_intent(task) is True, f"Failed to detect playback intent for: {text}"
+
+
+def test_media_playback_insufficient_media_state():
+    """
+    If readyState == 0 or currentTime == 0.0 even if paused is False,
+    media playback must NOT be verified.
+    """
+    task = BrowserTask(
+        task_id="t_media",
+        objective="Play song Yeh Fitoor Mera",
+        session_id="s1",
+    )
+    # Case 1: currentTime == 0.0
+    obs_zero = BrowserObservation(
+        session_id="s1",
+        task_id="t_media",
+        current_url="https://www.youtube.com/watch?v=123",
+        page_title="Yeh Fitoor Mera",
+        media_state=[{
+            "tag": "video",
+            "paused": False,
+            "currentTime": 0.0,
+            "duration": 200.0,
+            "readyState": 4,
+        }],
+    )
+    v1 = SemanticVerifier.verify(task, obs_zero)
+    assert v1.status == BrowserVerificationStatus.NOT_VERIFIED
+    assert "currentTime == 0" in v1.failure_reason or "not actively playing" in v1.failure_reason
+
+    # Case 2: readyState == 0 (HAVE_NOTHING)
+    obs_not_ready = BrowserObservation(
+        session_id="s1",
+        task_id="t_media",
+        current_url="https://www.youtube.com/watch?v=123",
+        page_title="Yeh Fitoor Mera",
+        media_state=[{
+            "tag": "video",
+            "paused": False,
+            "currentTime": 2.5,
+            "duration": 200.0,
+            "readyState": 0,
+        }],
+    )
+    v2 = SemanticVerifier.verify(task, obs_not_ready)
+    assert v2.status == BrowserVerificationStatus.NOT_VERIFIED
+    assert "readyState" in v2.failure_reason or "not actively playing" in v2.failure_reason
+

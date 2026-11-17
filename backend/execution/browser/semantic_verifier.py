@@ -252,21 +252,55 @@ class SemanticVerifier:
             )
 
         # ── 6b. HTML5 Media Playback Verification (Phase 4.1 / Stabilization) ─
-        crit_lower = (task.success_criteria or "").lower()
-        is_playback_task = any(w in obj_lower for w in ("play ", "play the", "playback", "playing", "listen to")) or any(w in crit_lower for w in ("play", "playback", "playing"))
-        if is_playback_task:
+        if cls._has_playback_intent(task):
             media_elements = observation.media_state or []
             if not media_elements and observation.page_snapshot and observation.page_snapshot.metadata:
                 media_elements = observation.page_snapshot.metadata.get("media_elements") or []
 
             active_media = None
+            buffering_media = []
+            stalled_media = []
+            paused_media = []
+
             for m in media_elements:
                 if m.get("tag") in ("video", "audio"):
-                    if not m.get("paused") and m.get("currentTime", 0.0) > 0.0:
+                    ready_state = m.get("readyState")
+                    is_ready = (ready_state is None) or (ready_state >= 2)
+                    is_paused = bool(m.get("paused"))
+                    current_time = float(m.get("currentTime", 0.0))
+
+                    if not is_paused and current_time > 0.0 and is_ready:
                         active_media = m
                         break
+                    elif is_paused:
+                        paused_media.append(m)
+                    elif ready_state is not None and ready_state <= 1:
+                        buffering_media.append(m)
+                    else:
+                        stalled_media.append(m)
 
             if active_media:
+                # Media identity validation: prevent false positives from autoplaying background ads
+                title_tokens = [
+                    w for w in re.findall(r"\w+", (task.objective or "").lower())
+                    if w not in _STOP_WORDS and len(w) > 3
+                ]
+                identity_matched = True
+                if title_tokens:
+                    search_scope = f"{url.lower()} {title.lower()} {observation.page_text_summary.lower() if observation.page_text_summary else ''}"
+                    identity_matched = any(tok in search_scope for tok in title_tokens)
+
+                if not identity_matched:
+                    return BrowserVerification(
+                        task_id=task.task_id,
+                        status=BrowserVerificationStatus.NOT_VERIFIED,
+                        observed_url=url,
+                        observed_title=title,
+                        confidence_score=0.25,
+                        verified_by="media identity verification guard",
+                        failure_reason=f"Media is playing but neither page URL, title, nor text matches requested objective tokens: {title_tokens}",
+                    )
+
                 ct = active_media.get("currentTime", 0.0)
                 dur = active_media.get("duration", 0.0)
                 conf = 0.95 if ct >= 2.0 else 0.90
@@ -290,6 +324,13 @@ class SemanticVerifier:
                 )
             else:
                 paused_info = ", ".join(f"{m.get('tag')}(paused={m.get('paused')}, time={m.get('currentTime')}s)" for m in media_elements[:3])
+                if buffering_media:
+                    state_desc = f"Media element found but not actively playing (buffering readyState <= 1): {paused_info}"
+                elif stalled_media:
+                    state_desc = f"Media element found but not actively playing (stalled/unavailable): {paused_info}"
+                else:
+                    state_desc = f"Media element found but not actively playing: {paused_info}"
+
                 return BrowserVerification(
                     task_id=task.task_id,
                     status=BrowserVerificationStatus.NOT_VERIFIED,
@@ -297,7 +338,7 @@ class SemanticVerifier:
                     observed_title=title,
                     confidence_score=0.30,
                     verified_by="HTML5 media playback guard",
-                    failure_reason=f"Media element found but not actively playing: {paused_info}",
+                    failure_reason=state_desc,
                 )
 
         # ── 7. Semantic text verification fallback ────────────────────────────
@@ -395,25 +436,35 @@ class SemanticVerifier:
                         break
             if c_score is not None:
                 task_confidences.append(float(c_score))
+            else:
+                status_str = node.status.value if hasattr(node.status, "value") else str(node.status)
+                if status_str == "completed":
+                    task_confidences.append(0.70)
+                else:
+                    task_confidences.append(0.0)
 
-        mean_conf = (sum(task_confidences) / len(task_confidences)) if task_confidences else 0.70
+        # Honest weakest-link goal confidence:
+        # In a required sequence, high confidence tasks cannot conceal a weak link
+        min_conf = min(task_confidences) if task_confidences else 0.50
+        mean_conf = (sum(task_confidences) / len(task_confidences)) if task_confidences else 0.50
+        weakest_link_conf = round(min(min_conf, mean_conf), 2)
 
         if failed_count > 0:
             overall = "failed"
-            conf = 0.90
+            conf = 0.0
             explanation = f"Goal failed: {failed_count} task(s) failed or were blocked."
         elif needs_review_count > 0:
             overall = "needs_human_review"
-            conf = 0.50
+            conf = round(min(0.50, weakest_link_conf), 2)
             explanation = f"Goal requires operator review: {needs_review_count} task(s) in uncertain or approval state."
         elif verified_count == total:
             overall = "verified"
-            # Mathematically computed confidence: bounded by aggregate task confidence
-            conf = round(min(0.99, max(0.50, mean_conf)), 2)
-            explanation = f"Goal fully verified: all {total} task(s) completed (aggregate confidence: {conf * 100:.1f}% based on {len(task_confidences)} verified task scores)."
+            # Honest weakest-link confidence: bounded by the minimum confidence task
+            conf = round(min(0.99, max(0.10, weakest_link_conf)), 2)
+            explanation = f"Goal fully verified: all {total} task(s) completed (weakest-link confidence: {conf * 100:.1f}% based on {len(task_confidences)} task scores)."
         else:
             overall = "inconclusive"
-            conf = round(min(0.50, max(0.10, mean_conf * (verified_count / total))), 2)
+            conf = round(min(0.50, max(0.0, weakest_link_conf * (verified_count / total))), 2)
             explanation = f"Goal incomplete: {verified_count}/{total} tasks verified, {inconclusive_count} remaining."
 
         return GoalVerificationResult(
@@ -565,6 +616,54 @@ class SemanticVerifier:
             return True, "Screenshot artifact present in page snapshot.", observation.page_snapshot.screenshot_base64
 
         return False, "Task required a screenshot, but no successful screenshot action was recorded.", None
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Media Playback Intent Detection
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @classmethod
+    def _has_playback_intent(cls, task: BrowserTask) -> bool:
+        """
+        Determines whether the task objective or criteria explicitly requires media playback.
+        Uses strict word-boundary matching and negative checks to prevent false triggers on
+        incidental terms like 'display', 'playlist', 'play store', or 'gameplay'.
+        """
+        text = f"{task.objective or ''} {task.success_criteria or ''}".lower()
+        if not text.strip():
+            return False
+
+        # Exclude false-positive patterns where 'play' is a substring or non-playback noun:
+        # e.g. 'display', 'playlist', 'google play', 'play store', 'playwright', 'roleplay', 'gameplay', 'coldplay'
+        cleaned = re.sub(
+            r'\b(?:display(?:ing|ed|s)?|playlist(?:s)?|playwright|play\s+store|google\s+play|gameplay|roleplay|coldplay)\b',
+            ' ',
+            text
+        )
+
+        # 1. Direct playback verbs/nouns: playback, playing
+        if re.search(r'\b(?:playback|is\s+playing|currently\s+playing|start\s+playing)\b', cleaned):
+            return True
+
+        # 2. 'play' as an action targeting media: e.g. 'play song', 'play video', 'play track', 'play audio', 'play music',
+        #    'play the', 'play it', or 'and play'
+        if re.search(r'\bplay\s+(?:the\s+)?(?:song|video|track|audio|music|episode|podcast|movie|clip|sound)\b', cleaned):
+            return True
+
+        if re.search(r'\b(?:and|then)\s+play\b', cleaned):
+            return True
+
+        if re.search(r'\bplay\s+(?:the\s+)?[a-zA-Z0-9_\-"]+', cleaned) and any(w in cleaned for w in ("song", "video", "music", "audio", "track", "youtube", "spotify", "soundcloud")):
+            return True
+
+        # 3. 'listen to' media
+        if re.search(r'\blisten\s+to\b', cleaned) and any(w in cleaned for w in ("song", "music", "audio", "track", "podcast", "episode")):
+            return True
+
+        # 4. Success criteria explicitly requiring video/audio playing
+        if re.search(r'\b(?:video|audio|media)\s+(?:is\s+)?(?:playing|active)\b', cleaned):
+            return True
+
+        return False
 
     # ─────────────────────────────────────────────────────────────────────────
     # Success Criteria & Text Verification

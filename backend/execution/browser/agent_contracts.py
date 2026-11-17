@@ -603,6 +603,19 @@ class BrowserAgentResult(BaseModel):
         default=None,
         description="Base64-encoded screenshot of the final browser state",
     )
+    llm_calls_count: int = Field(
+        default=0,
+        ge=0,
+        description="Total number of LLM inference calls made during this task",
+    )
+    fast_path_used: bool = Field(
+        default=False,
+        description="True if the task executed via deterministic fast-path without LLM calls",
+    )
+    model_name: Optional[str] = Field(
+        default=None,
+        description="Model identifier used for LLM decisions (e.g. gemini-3.5-flash)",
+    )
 
     @property
     def succeeded(self) -> bool:

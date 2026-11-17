@@ -198,6 +198,28 @@ class NetworkGuard:
     Authoritative network guard defending browser automation against SSRF.
     """
 
+    _test_allowed_origins: Set[str] = set()
+
+    @classmethod
+    def register_test_allowed_origin(cls, origin: str) -> None:
+        """
+        Explicit, narrowly-scoped test fixture origin exemption.
+        Only functional in non-production environments.
+        """
+        from core.config import settings
+        if not settings.is_production() and origin:
+            cls._test_allowed_origins.add(origin.rstrip("/"))
+
+    @classmethod
+    def unregister_test_allowed_origin(cls, origin: str) -> None:
+        """Removes a previously registered test fixture origin."""
+        cls._test_allowed_origins.discard(origin.rstrip("/"))
+
+    @classmethod
+    def clear_test_allowed_origins(cls) -> None:
+        """Clears all test-registered origins."""
+        cls._test_allowed_origins.clear()
+
     @classmethod
     def validate_url(cls, url: str) -> NetworkGuardVerdict:
         """
@@ -213,6 +235,18 @@ class NetworkGuard:
         # Allow about:blank for fresh tab initialization
         if url.strip() == "about:blank":
             return NetworkGuardVerdict(allowed=True, reason="about:blank allowed", url=url)
+
+        # Check explicit test-only allowed origins (strictly disabled in production)
+        from core.config import settings
+        if not settings.is_production() and cls._test_allowed_origins:
+            norm_url = url.strip()
+            for allowed_origin in cls._test_allowed_origins:
+                if norm_url.startswith(allowed_origin + "/") or norm_url == allowed_origin:
+                    return NetworkGuardVerdict(
+                        allowed=True,
+                        reason=f"Explicit test fixture origin permitted: {allowed_origin}",
+                        url=url,
+                    )
 
         try:
             parsed = urlparse(url.strip())
@@ -434,6 +468,13 @@ class NetworkGuard:
         async def response_handler(response: Any):
             """Inspects response server socket IP to detect and abort DNS rebinding."""
             try:
+                # Explicit test-only fixture origin exemption (strictly disabled in production)
+                from core.config import settings
+                if not settings.is_production() and cls._test_allowed_origins:
+                    res_url = getattr(response, "url", "")
+                    if any(res_url.startswith(orig + "/") or res_url == orig for orig in cls._test_allowed_origins):
+                        return
+
                 if hasattr(response, "server_addr"):
                     server_addr = await response.server_addr()
                     if server_addr and isinstance(server_addr, dict) and "ipAddress" in server_addr:

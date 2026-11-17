@@ -203,7 +203,7 @@ export default function ExecutionControl() {
                       <div className="flex flex-col gap-0.5">
                         <span className="text-xs font-bold text-slate-900 capitalize tracking-tight leading-none">{status} Status</span>
                         <span className="text-[10px] font-semibold text-slate-500">
-                          {metrics ? `${metrics.tasks_completed} / ${metrics.tasks_total} Tasks Completed (${((metrics.success_rate || 0)).toFixed(0)}%)` : 'Ready for prompt dispatch'}
+                          {metrics ? `${metrics.tasks_completed} / ${metrics.tasks_total} Tasks Completed (${(((metrics.success_rate ?? 0) <= 1.0 ? (metrics.success_rate ?? 0) * 100 : (metrics.success_rate ?? 0))).toFixed(0)}%)` : 'Ready for prompt dispatch'}
                         </span>
                       </div>
                     </div>

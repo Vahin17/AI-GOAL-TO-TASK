@@ -1,5 +1,6 @@
 import logging
 import uuid
+from typing import Optional
 from datetime import datetime
 from schemas.models import PlanGraphResponse
 from core.config import settings
@@ -25,11 +26,11 @@ def get_llm_provider():
         from ai.gemini_provider import GeminiProvider
         return GeminiProvider()
 
-async def generate_task_graph(goal_text: str) -> PlanGraphResponse:
+async def generate_task_graph(goal_text: str, user_id: Optional[str] = None) -> PlanGraphResponse:
     """
     Main orchestration controller:
     1. Validates and sanitizes input goal via InputGuard (Phase 1).
-    2. Retrieves relevant domain knowledge via Hybrid RAG (Phase 1).
+    2. Retrieves relevant domain knowledge via Hybrid RAG (Phase 1) with tenant isolation.
     3. Decomposes goal using LLM with injected RAG context and untrusted tags.
     4. Evaluates plan validity via Independent Plan Critic with bounded retry (Phase 1).
     5. Evaluates batch safety via SafetyEngine (Phase 5).
@@ -53,6 +54,7 @@ async def generate_task_graph(goal_text: str) -> PlanGraphResponse:
     goal_public_id = f"goal_{uuid.uuid4().hex[:8]}"
     goal_record = {
         "public_id": goal_public_id,
+        "user_id": user_id,
         "goal": sanitized_goal,
         "raw_goal": goal_text,
         "input_guard": guard_result.model_dump(),
@@ -69,7 +71,7 @@ async def generate_task_graph(goal_text: str) -> PlanGraphResponse:
     if getattr(settings, "ENABLE_RAG", True):
         try:
             rag_service = RAGService.get_instance()
-            rag_context, provenance_obj = rag_service.get_relevant_context_for_goal(sanitized_goal)
+            rag_context, provenance_obj = rag_service.get_relevant_context_for_goal(sanitized_goal, user_id=user_id)
             provenance = provenance_obj.model_dump()
             logger.info(f"[Orchestrator] Retrieved Hybrid RAG context ({provenance_obj.chunk_count} chunks, {provenance_obj.context_char_count} chars, latency: {provenance_obj.retrieval_latency_ms}ms)")
         except Exception as e:
@@ -114,7 +116,18 @@ async def generate_task_graph(goal_text: str) -> PlanGraphResponse:
 
         if not critic_result.requires_regeneration or attempt >= max_critic_attempts:
             if critic_result.requires_regeneration:
-                logger.warning(f"[PlanCritic] Critic issues remaining after attempt {attempt}: {critic_result.summary}")
+                logger.warning(
+                    f"[PlanCritic] Critic issues remaining after attempt {attempt}: {critic_result.summary}. "
+                    f"Rejecting invalid plan and falling back to safe deterministic plan."
+                )
+                plan_response = await generate_fallback_plan(sanitized_goal)
+                fb_critic = PlanCritic.evaluate_grounding_and_relevance(
+                    goal=sanitized_goal,
+                    nodes=plan_response.nodes,
+                    edges=plan_response.edges,
+                    rag_context=rag_context,
+                )
+                plan_response.critic_result = fb_critic.model_dump()
             else:
                 logger.info(f"[PlanCritic] Verification passed: {critic_result.summary}")
             break
@@ -124,6 +137,13 @@ async def generate_task_graph(goal_text: str) -> PlanGraphResponse:
 
     if plan_response is None:
         plan_response = await generate_fallback_plan(sanitized_goal)
+        fb_critic = PlanCritic.evaluate_grounding_and_relevance(
+            goal=sanitized_goal,
+            nodes=plan_response.nodes,
+            edges=plan_response.edges,
+            rag_context=rag_context,
+        )
+        plan_response.critic_result = fb_critic.model_dump()
 
     # Attach RAG provenance to response
     if provenance:

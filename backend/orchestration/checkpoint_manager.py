@@ -128,13 +128,15 @@ class ExecutionCheckpointManager:
         trigger: str,
         metadata: Optional[Dict[str, Any]] = None,
         db: Optional[Any] = None,
+        user_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Persists a complete execution checkpoint.
+        Persists a complete execution checkpoint with tenant isolation.
         Updates task_runtime_state and appends to execution_checkpoints.
         """
         now = time.time()
         checkpoint_id = f"chk_{uuid.uuid4().hex[:12]}"
+        resolved_user_id = user_id or getattr(graph, "user_id", None) or (metadata.get("user_id") if metadata else None)
 
         # Extract node statuses
         node_states: Dict[str, Dict[str, Any]] = {}
@@ -168,6 +170,7 @@ class ExecutionCheckpointManager:
         checkpoint_doc: Dict[str, Any] = {
             "checkpoint_id": checkpoint_id,
             "session_id": session_id,
+            "user_id": resolved_user_id,
             "plan_hash": graph.plan_hash,
             "trigger": trigger,
             "timestamp": now,
@@ -194,6 +197,7 @@ class ExecutionCheckpointManager:
                     {"session_id": session_id},
                     {"$set": {
                         "session_id": session_id,
+                        "user_id": resolved_user_id,
                         "latest_checkpoint_id": checkpoint_id,
                         "plan_hash": graph.plan_hash,
                         "updated_at": now,

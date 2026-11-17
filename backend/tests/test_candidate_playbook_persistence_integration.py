@@ -9,83 +9,120 @@ from orchestration.dag_builder import ARDOTaskNode, ARDOGraph
 from orchestration.state_machine import TaskState
 
 
+@pytest.mark.live_db
 def test_candidate_playbook_and_semantic_memory_live_persistence():
     auth_db = AuthDatabase.get_instance()
-    
-    # 1. Setup isolated test user
-    unique_email = f"test_persist_{uuid.uuid4().hex[:8]}@ardo.ai"
-    user = auth_db.create_user(
-        email=unique_email,
-        full_name="Persist Test User",
-        password_hash="secure_hash_123",
-    )
-    user_id = user["id"]
+    user_id = None
+    playbook_id = None
     test_session_id = f"sess_persist_{uuid.uuid4().hex[:8]}"
+    memory_store = None
 
-    # 2. Build verified graph
-    node1 = ARDOTaskNode(
-        task_id="t1",
-        task_name="Open YouTube",
-        status=TaskState.COMPLETED,
-    )
-    graph = ARDOGraph(nodes={"t1": node1}, session_id=test_session_id)
+    try:
+        # 1. Setup isolated test user
+        unique_email = f"test_persist_{uuid.uuid4().hex[:8]}@ardo.ai"
+        user = auth_db.create_user(
+            email=unique_email,
+            full_name="Persist Test User",
+            password_hash="secure_hash_123",
+        )
+        user_id = user["id"]
 
-    goal_verif = GoalVerificationResult(
-        session_id=test_session_id,
-        goal_text="Play song Yeh Fitoor Mera on YouTube",
-        overall_status="verified",
-        confidence_score=0.92,
-        total_tasks=1,
-        verified_tasks=1,
-    )
+        # 2. Build verified graph
+        node1 = ARDOTaskNode(
+            task_id="t1",
+            task_name="Open YouTube",
+            status=TaskState.COMPLETED,
+        )
+        graph = ARDOGraph(nodes={"t1": node1}, session_id=test_session_id)
 
-    # 3. Generate candidate playbook
-    candidate = PlaybookService.generate_candidate_playbook(
-        user_id=user_id,
-        session_id=test_session_id,
-        goal_text="Play song Yeh Fitoor Mera on YouTube",
-        graph=graph,
-        goal_verification=goal_verif,
-    )
+        goal_verif = GoalVerificationResult(
+            session_id=test_session_id,
+            goal_text="Play song Yeh Fitoor Mera on YouTube",
+            overall_status="verified",
+            confidence_score=0.92,
+            total_tasks=1,
+            verified_tasks=1,
+        )
 
-    assert candidate is not None
-    playbook_id = candidate["id"]
-    assert candidate["status"] == "candidate"
-    assert candidate["confidence_score"] == 0.92
+        # 3. Generate candidate playbook
+        candidate = PlaybookService.generate_candidate_playbook(
+            user_id=user_id,
+            session_id=test_session_id,
+            goal_text="Play song Yeh Fitoor Mera on YouTube",
+            graph=graph,
+            goal_verification=goal_verif,
+        )
 
-    # Verify retrieval from PostgreSQL authoritative store
-    retrieved_pb = PlaybookService.get_playbook_by_id(playbook_id, user_id=user_id)
-    assert retrieved_pb is not None
-    assert retrieved_pb["id"] == playbook_id
-    assert retrieved_pb["status"] == "candidate"
+        assert candidate is not None
+        playbook_id = candidate["id"]
+        assert candidate["status"] == "candidate"
+        assert candidate["confidence_score"] == 0.92
 
-    # Promote verified candidate
-    promoted = PlaybookService.promote_candidate(playbook_id, user_id=user_id)
-    assert promoted is True
+        # Verify retrieval from PostgreSQL authoritative store
+        retrieved_pb = PlaybookService.get_playbook_by_id(playbook_id, user_id=user_id)
+        assert retrieved_pb is not None
+        assert retrieved_pb["id"] == playbook_id
+        assert retrieved_pb["status"] == "candidate"
 
-    updated_pb = PlaybookService.get_playbook_by_id(playbook_id, user_id=user_id)
-    assert updated_pb["status"] == "promoted"
-    assert updated_pb["version"] == 2
+        # Promote verified candidate
+        promoted = PlaybookService.promote_candidate(playbook_id, user_id=user_id)
+        assert promoted is True
 
-    # 4. Test Semantic Memory persistence and retrieval
-    memory_store = SemanticMemoryStore()
-    memory_item = memory_store.record_memory(
-        goal_text="Play song Yeh Fitoor Mera on YouTube",
-        plan_id=f"plan_{uuid.uuid4().hex[:8]}",
-        session_id=test_session_id,
-        memory_type="successful_plan",
-        task_summary="Navigated to YouTube, searched for Yeh Fitoor Mera, verified playback",
-        outcome_status="verified",
-    )
-    assert memory_item is not None
-    assert memory_item.memory_id is not None
+        updated_pb = PlaybookService.get_playbook_by_id(playbook_id, user_id=user_id)
+        assert updated_pb["status"] == "promoted"
+        assert updated_pb["version"] == 2
 
-    # Retrieve memory
-    matches = memory_store.retrieve_memories(
-        goal_query="Yeh Fitoor Mera song playback",
-        top_k=3,
-        min_score=0.1,
-    )
-    assert len(matches) > 0
-    assert any("Yeh Fitoor Mera" in m.goal_text for m in matches)
+        # 4. Test Semantic Memory persistence and retrieval
+        memory_store = SemanticMemoryStore()
+        memory_item = memory_store.record_memory(
+            goal_text="Play song Yeh Fitoor Mera on YouTube",
+            plan_id=f"plan_{uuid.uuid4().hex[:8]}",
+            session_id=test_session_id,
+            memory_type="successful_plan",
+            task_summary="Navigated to YouTube, searched for Yeh Fitoor Mera, verified playback",
+            outcome_status="verified",
+        )
+        assert memory_item is not None
+        assert memory_item.memory_id is not None
+
+        # Retrieve memory
+        matches = memory_store.retrieve_memories(
+            goal_query="Yeh Fitoor Mera song playback",
+            top_k=3,
+            min_score=0.1,
+        )
+        assert len(matches) > 0
+        assert any("Yeh Fitoor Mera" in m.goal_text for m in matches)
+    finally:
+        # Safe cleanup of all test-created artifacts
+        if playbook_id and user_id:
+            try:
+                if auth_db._is_pg and auth_db._pg_conn:
+                    with auth_db._pg_conn.cursor() as cur:
+                        cur.execute("DELETE FROM playbooks WHERE id = %s", (playbook_id,))
+                elif auth_db._sqlite_conn:
+                    cur = auth_db._sqlite_conn.cursor()
+                    cur.execute("DELETE FROM playbooks WHERE id = ?", (playbook_id,))
+                    auth_db._sqlite_conn.commit()
+            except Exception:
+                pass
+
+        if user_id:
+            try:
+                if auth_db._is_pg and auth_db._pg_conn:
+                    with auth_db._pg_conn.cursor() as cur:
+                        cur.execute("DELETE FROM users WHERE id = %s", (user_id,))
+                elif auth_db._sqlite_conn:
+                    cur = auth_db._sqlite_conn.cursor()
+                    cur.execute("DELETE FROM users WHERE id = ?", (user_id,))
+                    auth_db._sqlite_conn.commit()
+            except Exception:
+                pass
+
+        if memory_store and hasattr(memory_store, "_pg_conn") and memory_store._pg_conn:
+            try:
+                with memory_store._pg_conn.cursor() as cur:
+                    cur.execute("DELETE FROM execution_memories WHERE session_id = %s", (test_session_id,))
+            except Exception:
+                pass
 

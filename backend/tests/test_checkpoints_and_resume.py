@@ -203,12 +203,14 @@ async def test_api_resume_interrupted_session(setup_checkpoint_env):
     ]
     graph = DAGBuilder.build(nodes, [{"source": "t1", "target": "t2"}], goal_text="Resume Goal")
     graph.session_id = session_id
+    graph.user_id = user["id"]
     graph.nodes["t1"].status = TaskState.COMPLETED
 
     # Save checkpoint with t1 completed
     await ExecutionCheckpointManager.save_checkpoint(
         session_id=session_id,
         graph=graph,
+        user_id=user["id"],
         trigger="t1_done",
     )
 

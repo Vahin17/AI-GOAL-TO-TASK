@@ -165,6 +165,7 @@ class ARDOGraph:
     parallel_groups: List[List[str]] = field(default_factory=list)
     session_id: str = field(default_factory=lambda: f"ardo_{uuid.uuid4().hex[:10]}")
     plan_hash: Optional[str] = field(default=None)
+    user_id: Optional[str] = field(default=None)
     raw_nodes: List[Dict[str, Any]] = field(default_factory=list)
     raw_edges: List[Dict[str, Any]] = field(default_factory=list)
     goal_text: Optional[str] = field(default=None)
@@ -185,19 +186,33 @@ class ARDOGraph:
         """Serialise all nodes for MongoDB persistence / API response."""
         return [n.to_dict() for n in self.nodes.values()]
 
-    def recompute_plan_hash(self, goal_text: Optional[str] = None) -> str:
+    def recompute_plan_hash(
+        self,
+        goal_text: Optional[str] = None,
+        session_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> str:
         """
         Recomputes canonical SHA-256 plan hash directly from the current graph structure.
         Any modification to node task_names, tools, or dependencies strictly produces a different hash.
+        When session_id or user_id are present, they are cryptographically bound to the hash.
         """
         from orchestration.plan_hasher import compute_plan_hash
         goal = goal_text or self.goal_text or ""
+        sid = session_id or getattr(self, "session_id", None)
+        uid = user_id or getattr(self, "user_id", None)
         reconstructed_edges = [
             {"source": src, "target": tgt}
             for src, targets in self.adjacency.items()
             for tgt in targets
         ]
-        return compute_plan_hash(list(self.nodes.values()), reconstructed_edges, intent=goal)
+        return compute_plan_hash(
+            list(self.nodes.values()),
+            reconstructed_edges,
+            intent=goal,
+            session_id=sid,
+            user_id=uid,
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -226,6 +241,8 @@ class DAGBuilder:
         safety_decisions: Optional[Dict[str, "SafetyDecision"]] = None,
         goal_text: str = "",
         context: Optional[Dict] = None,
+        session_id: Optional[str] = None,
+        user_id: Optional[str] = None,
     ) -> ARDOGraph:
         """
         Build and validate an ARDOGraph.
@@ -371,8 +388,19 @@ class DAGBuilder:
                     if len(group) > 1:
                         graph.nodes[task_id].execution_type = "parallel"
 
+        if session_id:
+            graph.session_id = session_id
+        if user_id:
+            graph.user_id = user_id
+
         from orchestration.plan_hasher import compute_plan_hash
-        graph.plan_hash = compute_plan_hash(nodes_data, edges_data, intent=goal_text)
+        graph.plan_hash = compute_plan_hash(
+            nodes_data,
+            edges_data,
+            intent=goal_text,
+            session_id=graph.session_id,
+            user_id=graph.user_id,
+        )
         graph.raw_nodes = nodes_data
         graph.raw_edges = edges_data
         graph.goal_text = goal_text

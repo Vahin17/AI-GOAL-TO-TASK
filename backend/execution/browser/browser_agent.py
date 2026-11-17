@@ -229,7 +229,12 @@ class BrowserAgent:
                 norm_pre = SemanticVerifier._normalize_url(task.precondition_url)
                 norm_cur = SemanticVerifier._normalize_url(observation.current_url or "")
                 url_match, _ = SemanticVerifier._verify_url([norm_pre], observation.current_url or "")
-                if not url_match and (norm_pre.startswith("http://") or norm_pre.startswith("https://")):
+                is_mutating = (
+                    getattr(task, "is_mutating", False)
+                    or (isinstance(task.metadata, dict) and task.metadata.get("is_mutating", False))
+                    or any(w in (task.objective or "").lower() for w in ("submit", "pay", "purchase", "delete", "post", "confirm", "order", "buy", "checkout"))
+                )
+                if not is_mutating and not url_match and (norm_pre.startswith("http://") or norm_pre.startswith("https://")):
                     logger.warning(
                         f"[BrowserAgent] Precondition URL mismatch: current='{observation.current_url}', "
                         f"expected prerequisite='{task.precondition_url}'. Triggering prerequisite navigation recovery."
@@ -247,6 +252,11 @@ class BrowserAgent:
                         ),
                     )
                     is_explicit = True
+                elif is_mutating and not url_match:
+                    logger.warning(
+                        f"[BrowserAgent] Precondition URL mismatch on mutating/non-idempotent task ('{task.objective}'). "
+                        f"Suppressing automatic re-navigation to prevent destructive state re-entry."
+                    )
 
             # Fast-path 1: If an action was executed, verify if an atomic task is already fully satisfied
             obj_lower = (task.objective or "").lower()
@@ -317,12 +327,23 @@ class BrowserAgent:
                         observation=observation,
                     )
                 except Exception as exc:
+                    from core.retry_utils import classify_provider_error
+
                     exc_str = str(exc).lower()
-                    if any(q in exc_str for q in ("quota", "429", "resource_exhausted", "free_tier", "unauthorized", "auth", "service unavailable")):
-                        logger.error(f"[BrowserAgent] Unrecoverable Gemini failure detected at iteration {iteration + 1}: {exc}")
-                        last_error = f"Unrecoverable LLM failure: {exc}"
+                    status_code = getattr(exc, "status_code", 429 if "429" in exc_str else (503 if "503" in exc_str else 0))
+                    failure_type, is_permanent = classify_provider_error(status_code, exc_str)
+
+                    # Only permanent quota or auth failure aborts immediately without recovery
+                    if is_permanent:
+                        logger.error(
+                            f"[BrowserAgent] Unrecoverable Gemini provider failure ({failure_type}) "
+                            f"at iteration {iteration + 1}: {exc}"
+                        )
+                        last_error = f"Unrecoverable LLM failure ({failure_type}): {exc}"
                         self._emit_event("execution_failed", task, {
                             "reason": last_error,
+                            "failure_type": failure_type,
+                            "is_permanent": True,
                         })
                         return self._make_result(
                             task=task,
@@ -333,12 +354,23 @@ class BrowserAgent:
                             observation=observation,
                         )
 
-                    logger.error(f"[BrowserAgent] Gemini call failed at iteration {iteration + 1}: {exc}")
-                    last_error = f"LLM decision failed: {exc}"
+                    # Transient failure (rate limit 429, 503, network)
+                    retry_after = getattr(exc, "retry_after", None)
+                    logger.warning(
+                        f"[BrowserAgent] Transient provider error ({failure_type}, retry_after={retry_after}) "
+                        f"at iteration {iteration + 1}: {exc}"
+                    )
+                    last_error = f"LLM decision failed ({failure_type}): {exc}"
                     consecutive_recovery_count += 1
+
+                    if retry_after is not None and 0.0 < retry_after <= 15.0:
+                        logger.info(f"[BrowserAgent] Backing off for {retry_after:.2f}s due to provider rate limit...")
+                        await asyncio.sleep(retry_after)
+
                     if consecutive_recovery_count > max_recovery_budget or iteration == task.max_actions - 1:
                         self._emit_event("recovery_exhausted", task, {
                             "reason": f"Recovery budget ({max_recovery_budget}) exhausted: {last_error}",
+                            "failure_type": failure_type,
                         })
                         return self._make_result(
                             task=task,
@@ -980,6 +1012,10 @@ class BrowserAgent:
         if obj_lower in UI_TARGET_WORDS:
             return None
 
+        # Objective must specify a search/find/lookup intent
+        if not any(w in obj_lower for w in ("search", "find", "look up")):
+            return None
+
         # 2. Quoted query extraction (highest precision)
         quote_match = re.search(
             r'(?:search|find|look\s+up)\s+(?:for\s+)?["\']([^"\'\n\r]+)["\']',
@@ -1105,12 +1141,13 @@ class BrowserAgent:
             aria_label = (el.aria_label or "").lower()
             text = (el.text or "").lower()
             el_id = (el.element_id or "").lower()
-            if tag in ("button", "input") or role == "button":
+            is_clickable = tag == "button" or role == "button" or (tag == "input" and (getattr(el, "input_type", None) in ("submit", "button", "image") or role == "button"))
+            if is_clickable:
                 if (
                     "search" in aria_label
                     or "search" in text
                     or "search" in el_id
-                    or el_id in ("search-icon-legacy", "search-button")
+                    or el_id in ("search-icon-legacy", "search-button", "project-search-btn")
                 ):
                     return el
         return None
@@ -1517,8 +1554,11 @@ class BrowserAgent:
         run_start: float,
         observation: Optional[BrowserObservation],
         verification: Optional[BrowserVerification] = None,
+        fast_path_used: bool = False,
     ) -> BrowserAgentResult:
         duration_ms = (time.perf_counter() - run_start) * 1000.0
+        raw_model = getattr(self._llm, "model_name", None)
+        model_name = raw_model if isinstance(raw_model, str) else None
         return BrowserAgentResult(
             task_id=task.task_id,
             session_id=task.session_id,
@@ -1531,6 +1571,9 @@ class BrowserAgent:
             duration_ms=duration_ms,
             final_url=observation.current_url if observation else None,
             final_title=observation.page_title if observation else None,
+            llm_calls_count=self._llm_call_count,
+            fast_path_used=fast_path_used or (self._llm_call_count == 0 and len(actions_taken) > 0),
+            model_name=model_name,
         )
 
 

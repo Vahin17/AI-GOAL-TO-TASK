@@ -52,6 +52,7 @@ def make_obs(
     tab_count: int = 1,
     session_id: str = "s_001",
     task_id: str = "t_001",
+    media_state: list = None,
 ) -> BrowserObservation:
     snapshot = PageSnapshot(url=url, title=title, screenshot_base64=screenshot_b64) if screenshot_b64 else None
     return BrowserObservation(
@@ -64,6 +65,7 @@ def make_obs(
         page_snapshot=snapshot,
         open_tab_count=tab_count,
         tabs=[TabInfo(tab_ref="tab_001", url=url, title=title, is_active=True, index=0)],
+        media_state=media_state,
     )
 
 def make_mock_observe(obs_list: list) -> AsyncMock:
@@ -384,9 +386,23 @@ async def test_dynamic_task_still_uses_gemini():
             ObservedElement(ref="elem_001", tag="input", css_selector="#search-input", role="searchbox", placeholder="Search")
         ],
     )
+    obs_playing = make_obs(
+        url="https://www.youtube.com/watch?v=vande_mataram",
+        title="Vande Mataram - Official Video",
+        task_id="t_dyn_01",
+        media_state=[
+            {
+                "tag": "video",
+                "paused": False,
+                "currentTime": 3.0,
+                "duration": 220.0,
+                "readyState": 4,
+            }
+        ],
+    )
 
     perception = MagicMock()
-    perception.observe = AsyncMock(return_value=obs_search)
+    perception.observe = AsyncMock(side_effect=[obs_search, obs_playing, obs_playing])
 
     async def mock_execute(task_id, session_id, action):
         return (

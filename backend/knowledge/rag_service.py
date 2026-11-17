@@ -253,6 +253,7 @@ class RAGService:
         top_k: Optional[int] = None,
         min_score: Optional[float] = None,
         include_memory: bool = True,
+        user_id: Optional[str] = None,
     ) -> Tuple[str, KnowledgeProvenance]:
         """
         Main interface called during task planning:
@@ -266,13 +267,15 @@ class RAGService:
             min_score=min_score,
         )
 
+        clean_user = str(user_id).strip() if user_id is not None else ""
         memories: List[ExecutionMemoryItem] = []
-        if include_memory and self.memory_store:
+        if include_memory and self.memory_store and clean_user:
             try:
                 memories = self.memory_store.retrieve_memories(
                     goal_query=goal_text,
                     top_k=2,
                     min_score=min_score or 0.35,
+                    user_id=clean_user,
                 )
             except Exception as e:
                 logger.warning(f"[RAGService] Memory retrieval warning: {e}")
@@ -289,6 +292,7 @@ class RAGService:
         execution_metrics: Optional[Dict[str, Any]] = None,
         safety_summary: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        user_id: Optional[str] = None,
     ) -> ExecutionMemoryItem:
         """
         Records the completed outcome of a planning/orchestration session
@@ -305,4 +309,5 @@ class RAGService:
             execution_metrics=execution_metrics,
             safety_summary=safety_summary,
             metadata=metadata,
+            user_id=user_id,
         )

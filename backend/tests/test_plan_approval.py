@@ -262,13 +262,14 @@ def test_api_approve_task_cross_user_forbidden(setup_auth_sqlite):
     client = TestClient(app)
     cookies = {"ardo_session": attacker_token}
 
-    # Attacker tries to approve owner's session -> HTTP 404/403 access denied
+    # Attacker tries to approve owner's session -> HTTP 404 access denied (no session enumeration)
     res = client.post(
         f"/orchestrate/{session_id}/approve/t1",
         json={"approved": True, "plan_hash": session.graph.plan_hash},
         cookies=cookies,
     )
-    assert res.status_code in (403, 404)
+    assert res.status_code == 404
+    assert res.json()["detail"] == f"Session {session_id} not found."
 
 
 # ── Test 7: RuntimeEngine Verification of Cryptographic Approval ─────────────
@@ -308,10 +309,10 @@ async def test_runtime_engine_verifies_cryptographic_approval(setup_auth_sqlite)
     assert any("Cryptographic approval verification failed" in log for log in node.execution_logs)
 
     # 3. Now record authoritative approval in AuthDB for a fresh node
-    graph2 = DAGBuilder.build(nodes, [], goal_text="Gated operation")
+    session_id2 = "ardo_runtime_approval_test_2"
+    graph2 = DAGBuilder.build(nodes, [], goal_text="Gated operation", session_id=session_id2, user_id=user["id"])
     node2 = graph2.get_node("t1")
     node2.approval_needed = True
-    session_id2 = "ardo_runtime_approval_test_2"
 
     db.record_plan_approval(
         session_id=session_id2,

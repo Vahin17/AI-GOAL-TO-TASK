@@ -16,10 +16,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import os
+import signal
+import subprocess
 import sys
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from execution.browser.browser_models import (
     BrowserAction,
@@ -29,6 +32,25 @@ from execution.browser.browser_models import (
 )
 
 logger = logging.getLogger(__name__)
+
+PLAYWRIGHT_TEARDOWN_TIMEOUT_SECONDS: float = float(
+    os.getenv("PLAYWRIGHT_TEARDOWN_TIMEOUT_SECONDS", "5.0")
+)
+
+
+def _terminate_pid(pid: int) -> None:
+    """Safely terminate a specific process and its descendants."""
+    try:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True,
+                timeout=5.0,
+            )
+        else:
+            os.kill(pid, signal.SIGKILL)
+    except Exception as e:
+        logger.warning(f"[PlaywrightBrowserExecutor] Could not terminate process {pid}: {e}")
 
 
 def _needs_proactor_delegation() -> bool:
@@ -63,6 +85,9 @@ class _ProactorWorker:
         )
         self._thread.start()
         self._worker_lock = threading.Lock()
+        self._is_healthy = True
+        self._timeout_count = 0
+        self._diagnostics: Dict[str, Any] = {}
         logger.info("[PlaywrightProactorWorker] ProactorEventLoop thread started.")
 
     @classmethod
@@ -73,11 +98,41 @@ class _ProactorWorker:
                     cls._instance = cls()
         return cls._instance
 
+    @classmethod
+    def reset_instance(cls) -> None:
+        """Reset singleton, allowing a replacement worker to be created cleanly."""
+        with cls._lock:
+            if cls._instance is not None:
+                try:
+                    cls._instance._loop.call_soon_threadsafe(cls._instance._loop.stop)
+                except Exception:
+                    pass
+                cls._instance = None
+                logger.info("[PlaywrightProactorWorker] Worker instance reset.")
+
+    @property
+    def is_healthy(self) -> bool:
+        return self._is_healthy
+
+    @property
+    def timeout_count(self) -> int:
+        return self._timeout_count
+
+    @property
+    def diagnostics(self) -> Dict[str, Any]:
+        return dict(self._diagnostics)
+
     async def run(self, coro):
         """
         Submit coro to the ProactorEventLoop and await its result with
         cancellation shielding and serialized pipe transport dispatch.
         """
+        if not self._is_healthy:
+            raise RuntimeError(
+                "PlaywrightProactorWorker is unhealthy due to a previous teardown timeout. "
+                "Call reset_instance() to recover."
+            )
+
         loop = asyncio.get_running_loop()
         fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
         wrap_fut = asyncio.wrap_future(fut, loop=loop)
@@ -88,11 +143,17 @@ class _ProactorWorker:
             return await asyncio.shield(wrap_fut)
         except asyncio.CancelledError:
             # When caller cancels, wait for underlying future to cleanly finish
-            # before propagating cancellation, avoiding IOCP _write_fut assertion failure
+            # with bounded timeout to avoid indefinite hang while preventing IOCP _write_fut corruption
             try:
-                await wrap_fut
-            except Exception:
-                pass
+                await asyncio.wait_for(
+                    asyncio.shield(wrap_fut),
+                    timeout=PLAYWRIGHT_TEARDOWN_TIMEOUT_SECONDS,
+                )
+            except (asyncio.TimeoutError, Exception) as e:
+                logger.error(f"[PlaywrightProactorWorker] Teardown timeout or error after cancellation: {e}")
+                self._is_healthy = False
+                self._timeout_count += 1
+                self._diagnostics["last_cancellation_error"] = str(e)
             raise
 
     @property
@@ -114,6 +175,19 @@ class _BrowserSession:
         self._page = None
         self._is_started = False
         self._op_lock = asyncio.Lock()
+        self._owned_pids: Set[int] = set()
+
+    def _track_driver_pid(self) -> None:
+        try:
+            impl = getattr(self._playwright, "_impl_obj", None)
+            conn = getattr(impl, "_connection", None)
+            trans = getattr(conn, "_transport", None)
+            proc = getattr(trans, "_proc", None)
+            pid = getattr(proc, "pid", None)
+            if pid:
+                self._owned_pids.add(int(pid))
+        except Exception:
+            pass
 
     async def start(self) -> None:
         if self._is_started:
@@ -122,6 +196,7 @@ class _BrowserSession:
             from playwright.async_api import async_playwright
             from core.config import settings
             self._playwright = await async_playwright().start()
+            self._track_driver_pid()
             launch_kwargs = {
                 "headless": self.headless,
                 "args": ["--no-sandbox", "--disable-dev-shm-usage"],
@@ -153,36 +228,46 @@ class _BrowserSession:
             raise
 
     async def stop(self) -> None:
-        if self._page:
-            try:
-                await self._page.close()
-            except Exception:
-                pass
-            self._page = None
-        if self._context:
-            try:
-                await self._context.close()
-            except Exception:
-                pass
-            self._context = None
-        if self._browser:
-            try:
-                await self._browser.close()
-            except Exception:
-                pass
-            self._browser = None
-        if self._playwright:
-            try:
-                await self._playwright.stop()
-            except Exception:
-                pass
-            self._playwright = None
+        try:
+            if self._page:
+                try:
+                    await self._page.close()
+                except Exception:
+                    pass
+                self._page = None
+            if self._context:
+                try:
+                    await self._context.close()
+                except Exception:
+                    pass
+                self._context = None
+            if self._browser:
+                try:
+                    await self._browser.close()
+                except Exception:
+                    pass
+                self._browser = None
+            if self._playwright:
+                try:
+                    await self._playwright.stop()
+                except Exception:
+                    pass
+                self._playwright = None
+        finally:
+            self._is_started = False
+            self.force_terminate()
+            logger.info("[PlaywrightBrowserExecutor] Browser stopped.")
+
+    def force_terminate(self) -> None:
+        """Forcefully terminates only the child processes spawned by this session if hung."""
+        for pid in list(self._owned_pids):
+            _terminate_pid(pid)
+        self._owned_pids.clear()
         self._is_started = False
-        logger.info("[PlaywrightBrowserExecutor] Browser stopped.")
 
     @property
     def is_running(self) -> bool:
-        return self._is_started and self._page is not None
+        return self._is_started
 
     async def inspect_page(self, max_elements: int = 50) -> Any:
         async with self._op_lock:
@@ -377,6 +462,18 @@ class _BrowserSession:
                 logger.info(f"[FILL] selector='{target_selector}' value_length={len(val)}")
                 await self._page.fill(target_selector, val, timeout=timeout)
 
+                # Real input-value verification: inspect DOM element to confirm actual entered value
+                actual_val = None
+                try:
+                    actual_val = await self._page.input_value(target_selector, timeout=min(timeout, 2000))
+                except Exception:
+                    try:
+                        el = await self._page.query_selector(target_selector)
+                        if el:
+                            actual_val = await el.evaluate("e => e.value ?? e.innerText ?? ''")
+                    except Exception:
+                        pass
+
                 duration = (time.perf_counter() - t_start) * 1000.0
                 current_title = None
                 try:
@@ -385,13 +482,31 @@ class _BrowserSession:
                 except Exception:
                     pass
 
+                meta = {"filled_length": len(val)}
+                if actual_val is not None:
+                    meta["actual_value"] = actual_val
+                    meta["input_verified"] = (actual_val == val)
+                    if val and not actual_val:
+                        logger.warning(
+                            f"[FILL-VERIFY] Intended value of length {len(val)} but DOM element value is empty."
+                        )
+                        return BrowserActionResult(
+                            success=False,
+                            action_type=action.action_type,
+                            current_url=self._page.url if self._page else None,
+                            current_title=current_title,
+                            error=f"Input value verification failed: element '{target_selector}' remained empty after fill",
+                            duration_ms=duration,
+                            metadata=meta,
+                        )
+
                 return BrowserActionResult(
                     success=True,
                     action_type=action.action_type,
                     current_url=self._page.url if self._page else None,
                     current_title=current_title,
                     duration_ms=duration,
-                    metadata={"filled_length": len(val)},
+                    metadata=meta,
                 )
 
             elif action.action_type == BrowserActionType.PRESS:
@@ -599,9 +714,18 @@ class PlaywrightBrowserExecutor:
         await self._run(self._get_session().start())
 
     async def stop(self) -> None:
-        """Close browser context, browser instance, and stop Playwright."""
+        """Close browser context, browser instance, and stop Playwright with bounded timeout."""
         if self._session is not None:
-            await self._run(self._session.stop())
+            session = self._session
+            self._session = None  # idempotent: repeated stop() is safe
+            try:
+                await asyncio.wait_for(
+                    self._run(session.stop()),
+                    timeout=PLAYWRIGHT_TEARDOWN_TIMEOUT_SECONDS,
+                )
+            except Exception as e:
+                logger.error(f"[PlaywrightBrowserExecutor] Stop timed out or failed: {e}")
+                session.force_terminate()
 
     async def __aenter__(self) -> "PlaywrightBrowserExecutor":
         await self.start()

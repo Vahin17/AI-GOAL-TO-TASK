@@ -126,11 +126,32 @@ _DOM_DISTILLATION_SCRIPT = """
         const name = node.getAttribute('name') || null;
         const elementId = node.id || null;
         const href = (tag === 'a') ? node.getAttribute('href') : null;
-        const value = (node.value !== undefined && tag !== 'button') ? String(node.value) : null;
-        const inputType = (tag === 'input') ? (node.type || 'text') : null;
+        const inputType = (tag === 'input') ? (node.type || 'text').toLowerCase() : null;
+        const autocomplete = node.getAttribute('autocomplete') || '';
         const enabled = !node.disabled && node.getAttribute('aria-disabled') !== 'true';
 
+        // Sensitive field detection: Never extract plaintext values from sensitive or credential inputs
+        const isSensitiveType = inputType === 'password';
+        const sensitivePattern = /password|secret|token|apikey|api_key|auth|credential|cvv|cvc|cardnumber|card_number|card_no|cardno|creditcard|credit_card|debit_card|csc|pan|ssn|social_security|socialsecurity|pin|passcode|access_token|refresh_token|bearer|private_key|privkey/i;
+        const sensitiveAutocomplete = /current-password|new-password|one-time-code|cc-number|cc-csc|cc-exp|cc-exp-month|cc-exp-year|cc-type|transaction-amount/i;
         let selector = generateSelector(node);
+        const isSensitiveField = isSensitiveType ||
+            sensitivePattern.test(name || '') ||
+            sensitivePattern.test(elementId || '') ||
+            sensitivePattern.test(autocomplete) ||
+            sensitiveAutocomplete.test(autocomplete) ||
+            sensitivePattern.test(ariaLabel || '') ||
+            sensitivePattern.test(placeholder || '') ||
+            sensitivePattern.test(selector || '');
+
+        let value = null;
+        if (node.value !== undefined && tag !== 'button') {
+            if (isSensitiveField) {
+                value = (String(node.value).length > 0) ? '[REDACTED]' : '';
+            } else {
+                value = String(node.value);
+            }
+        }
         if (selector in selectorCounts) {
             selectorCounts[selector]++;
             selector = `${selector}:nth-of-type(${selectorCounts[selector]})`;
@@ -151,7 +172,8 @@ _DOM_DISTILLATION_SCRIPT = """
             value: value,
             visible: true,
             enabled: enabled,
-            input_type: inputType
+            input_type: inputType,
+            autocomplete: autocomplete
         });
 
         if (results.length >= 60) {

@@ -916,8 +916,51 @@ async def create_ws_ticket(
 ):
     """
     Generate a 60-second single-use ticket for authenticating WebSocket connections.
-    Enables secure WebSocket authentication in cross-origin environments without exposing tokens.
+    Enforces strict session ownership validation before ticket issuance.
     """
+    from orchestration.scheduler import ARDOScheduler
+
+    active_session = ARDOScheduler._sessions.get(payload.session_id)
+    if active_session:
+        if not active_session.user_id or active_session.user_id != current_user["id"]:
+            raise HTTPException(
+                status_code=403,
+                detail="Forbidden: Cannot issue ticket for another user's session."
+            )
+    else:
+        found_history = False
+        for h in ARDOScheduler._session_history:
+            if h.get("session_id") == payload.session_id:
+                found_history = True
+                if not h.get("user_id") or h.get("user_id") != current_user["id"]:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Forbidden: Cannot issue ticket for another user's session."
+                    )
+                break
+        if not found_history:
+            from core.database import Database
+            if Database.db is not None:
+                try:
+                    doc = await Database.db.task_runtime_state.find_one({"session_id": payload.session_id})
+                    if doc:
+                        found_history = True
+                        doc_user = doc.get("user_id")
+                        if not doc_user or doc_user != current_user["id"]:
+                            raise HTTPException(
+                                status_code=403,
+                                detail="Forbidden: Cannot issue ticket for another user's session."
+                            )
+                except HTTPException:
+                    raise
+                except Exception:
+                    pass
+        if not found_history:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Session {payload.session_id} not found."
+            )
+
     ticket = ws_ticket_manager.issue_ticket(user_id=current_user["id"], session_id=payload.session_id)
     return WebSocketTicketResponse(
         ticket=ticket,

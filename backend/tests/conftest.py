@@ -18,6 +18,7 @@ This universally protects:
 - raw socket calls
 """
 
+import os
 import socket
 import http.client
 import urllib.request
@@ -102,3 +103,50 @@ def universal_no_network_guard():
     http.client.HTTPConnection.connect = _orig_http_connect
     http.client.HTTPSConnection.connect = _orig_https_connect
     urllib.request.urlopen = orig_urlopen
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--run-live",
+        action="store_true",
+        default=False,
+        help="Run live tests requiring live browser, live database, or external network.",
+    )
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "live_browser: mark test as requiring a live Playwright browser launch")
+    config.addinivalue_line("markers", "live_db: mark test as requiring a live PostgreSQL or MongoDB database")
+    config.addinivalue_line("markers", "live_network: mark test as requiring outbound external network access")
+
+
+def pytest_runtest_setup(item):
+    run_live = item.config.getoption("--run-live", False) or os.getenv("RUN_LIVE_TESTS") == "1"
+    live_markers = {"live_browser", "live_db", "live_network"}
+    item_markers = {m.name for m in item.iter_markers() if m.name in live_markers}
+    if item_markers and not run_live:
+        markers_str = ", ".join(f"@{m}" for m in sorted(item_markers))
+        pytest.skip(f"Live test skipped: requires {markers_str} (enable with --run-live or RUN_LIVE_TESTS=1)")
+
+
+@pytest.fixture(autouse=True)
+def reset_gemini_rate_limiter():
+    """Reset shared rate limiter state before and after each test for clean test isolation."""
+    try:
+        from ai.gemini_rate_limiter import GeminiSharedRateLimiter
+        GeminiSharedRateLimiter.reset_instance()
+    except Exception:
+        pass
+    yield
+    try:
+        from ai.gemini_rate_limiter import GeminiSharedRateLimiter
+        GeminiSharedRateLimiter.reset_instance()
+    except Exception:
+        pass
+
+
+@pytest.fixture(autouse=True, scope="session")
+def enforce_test_headless_browser():
+    """Enforce headless browser mode across all test executions."""
+    os.environ["HEADLESS_BROWSER"] = "true"
+

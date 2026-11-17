@@ -40,6 +40,7 @@ class ExecutionMemoryItem(BaseModel):
     A single historical execution memory record.
     """
     memory_id:         str = Field(default_factory=lambda: f"mem_{uuid.uuid4().hex[:12]}")
+    user_id:           Optional[str] = None
     goal_text:         str
     plan_id:           str = ""
     session_id:        str = ""
@@ -103,6 +104,8 @@ class SemanticMemoryStore:
         self.embedding_provider = embedding_provider or HybridEmbeddingService()
         self.in_memory = in_memory
         self.dim = getattr(self.embedding_provider, "active_dimension", getattr(self.embedding_provider, "dimension", 128))
+        self.db_vector_dim: Optional[int] = None
+        self._has_tsv_column: bool = False
 
         self._local_memories: Dict[str, ExecutionMemoryItem] = {}
         self._local_embeddings: Dict[str, List[float]] = {}
@@ -128,11 +131,46 @@ class SemanticMemoryStore:
                 cur.execute(MEMORY_SCHEMA_DDL.format(dim=self.dim))
 
             self._is_pg_connected = True
-            logger.info(f"[SemanticMemoryStore] Connected to PostgreSQL memories table (dim={self.dim}).")
+            self._inspect_db_schema()
+            logger.info(f"[SemanticMemoryStore] Connected to PostgreSQL memories table (provider_dim={self.dim}, db_dim={self.db_vector_dim}).")
         except Exception as e:
             logger.warning(f"[SemanticMemoryStore] PG connection failed: {e}. Using local store.")
             self._is_pg_connected = False
             self._pg_conn = None
+
+    def _inspect_db_schema(self) -> None:
+        """Inspects live PostgreSQL schema to determine actual dimension of embedding and tsvector column presence."""
+        if not self._pg_conn or not self._is_pg_connected:
+            return
+        try:
+            with self._pg_conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT format_type(atttypid, atttypmod)
+                    FROM pg_attribute
+                    WHERE attrelid = 'execution_memories'::regclass
+                      AND attname = 'embedding'
+                      AND NOT attisdropped;
+                    """
+                )
+                row = cur.fetchone()
+                if row and row[0]:
+                    import re
+                    match = re.search(r"vector\((\d+)\)", str(row[0]))
+                    if match:
+                        self.db_vector_dim = int(match.group(1))
+
+                cur.execute(
+                    """
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'execution_memories' AND column_name = 'tsv_content';
+                    """
+                )
+                self._has_tsv_column = bool(cur.fetchone())
+        except Exception as e:
+            logger.debug(f"[SemanticMemoryStore] Could not introspect vector column dimension: {e}")
+        if self.db_vector_dim is None:
+            self.db_vector_dim = self.dim
 
     @property
     def active_backend(self) -> str:
@@ -150,11 +188,17 @@ class SemanticMemoryStore:
         execution_metrics: Optional[Dict[str, Any]] = None,
         safety_summary: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        user_id: Optional[str] = None,
     ) -> ExecutionMemoryItem:
         """
-        Embeds and stores a new historical execution outcome record.
+        Embeds and stores a new historical execution outcome record with tenant isolation.
         """
+        meta = dict(metadata or {})
+        if user_id:
+            meta.setdefault("user_id", user_id)
+
         item = ExecutionMemoryItem(
+            user_id=user_id,
             goal_text=goal_text,
             plan_id=plan_id,
             session_id=session_id,
@@ -163,15 +207,52 @@ class SemanticMemoryStore:
             outcome_status=outcome_status,
             execution_metrics=execution_metrics or {},
             safety_summary=safety_summary or {},
-            metadata=metadata or {},
+            metadata=meta,
         )
 
         embed_text = f"{goal_text} | {task_summary}"
-        embedding = self.embedding_provider.embed_query(embed_text)
+        if hasattr(self.embedding_provider, "embed_query_with_provenance"):
+            res = self.embedding_provider.embed_query_with_provenance(embed_text)
+            embedding = res.vector
+            vec_dim = res.dimension
+            provider_name = res.provider
+            model_name = res.model
+            embedding_space = res.embedding_space
+        else:
+            embedding = self.embedding_provider.embed_query(embed_text)
+            vec_dim = len(embedding) if embedding else 0
+            provider_name = getattr(self.embedding_provider, "active_provider", "unknown")
+            model_name = getattr(self.embedding_provider, "active_model", getattr(self.embedding_provider, "model_name", "unknown"))
+            embedding_space = getattr(
+                self.embedding_provider,
+                "embedding_space",
+                f"{provider_name}:{model_name}:{vec_dim}",
+            )
+
+        item.metadata.setdefault("embedding_provider", provider_name)
+        item.metadata.setdefault("embedding_model", model_name)
+        item.metadata.setdefault("embedding_dim", vec_dim)
+        item.metadata.setdefault("embedding_space", embedding_space)
 
         if self._is_pg_connected and self._pg_conn:
             try:
                 from pgvector import Vector  # adapt Python list → pgvector type
+
+                # Compatibility verification:
+                # If generated embedding dimension does not match live DB column dimension,
+                # do NOT pass invalid vector (which triggers PostgreSQL dimension mismatch error).
+                # Instead, store with embedding=NULL; the row is safely persisted and indexed via tsv_content!
+                pg_vector_val = None
+                if self.db_vector_dim is None or vec_dim == self.db_vector_dim:
+                    pg_vector_val = Vector(embedding)
+                else:
+                    item.metadata["embedding_stored"] = False
+                    item.metadata["embedding_dim_mismatch"] = True
+                    logger.warning(
+                        f"[SemanticMemoryStore] Dimension mismatch: generated {vec_dim}-dim vector, "
+                        f"but DB schema expects {self.db_vector_dim}-dim. Storing memory with embedding=NULL for hybrid text search."
+                    )
+
                 with self._pg_conn.cursor() as cur:
                     cur.execute(
                         """
@@ -193,7 +274,7 @@ class SemanticMemoryStore:
                             json.dumps(item.execution_metrics),
                             json.dumps(item.safety_summary),
                             json.dumps(item.metadata),
-                            Vector(embedding),  # must be pgvector type, not numeric[]
+                            pg_vector_val,
                         ),
                     )
                 logger.info(f"[SemanticMemoryStore] Recorded memory '{item.memory_id}' in PostgreSQL.")
@@ -212,27 +293,79 @@ class SemanticMemoryStore:
         top_k: int = 3,
         min_score: float = 0.35,
         memory_type: Optional[str] = None,
+        user_id: Optional[str] = None,
     ) -> List[ExecutionMemoryItem]:
         """
-        Retrieves top-K most similar past execution memories for a target goal.
+        Retrieves top-K most similar past execution memories for a target goal with tenant isolation.
         """
         if not goal_query.strip():
             return []
 
-        query_vec = self.embedding_provider.embed_query(goal_query)
+        clean_uid = str(user_id).strip() if user_id is not None else None
+        if user_id is not None and not clean_uid:
+            logger.warning("[SemanticMemoryStore] Rejecting memory query with empty or whitespace user_id.")
+            return []
+
+        if hasattr(self.embedding_provider, "embed_query_with_provenance"):
+            res = self.embedding_provider.embed_query_with_provenance(goal_query)
+            query_vec = res.vector
+            vec_dim = res.dimension
+            provider_name = res.provider
+            model_name = res.model
+            query_space = res.embedding_space
+        else:
+            query_vec = self.embedding_provider.embed_query(goal_query)
+            vec_dim = len(query_vec) if query_vec else 0
+            provider_name = getattr(self.embedding_provider, "active_provider", "unknown")
+            model_name = getattr(self.embedding_provider, "active_model", getattr(self.embedding_provider, "model_name", "unknown"))
+            query_space = getattr(
+                self.embedding_provider,
+                "embedding_space",
+                f"{provider_name}:{model_name}:{vec_dim}",
+            )
 
         if self._is_pg_connected and self._pg_conn:
+            # Dimension compatibility check:
+            # If query vector dimension does not match DB column dimension,
+            # do NOT execute vector cosine query (which causes a PostgreSQL error).
+            # Instead, route seamlessly to tsvector full-text search over goal_text & task_summary!
+            if self.db_vector_dim is not None and vec_dim != self.db_vector_dim:
+                logger.warning(
+                    f"[SemanticMemoryStore] Query vector dimension mismatch: query={vec_dim}, DB={self.db_vector_dim}. "
+                    f"Executing tsvector full-text search fallback over historical memories."
+                )
+                ts_kwargs: Dict[str, Any] = {
+                    "goal_query": goal_query,
+                    "top_k": top_k,
+                    "min_score": min_score,
+                    "memory_type": memory_type,
+                }
+                if clean_uid is not None:
+                    ts_kwargs["user_id"] = clean_uid
+                ts_results = self._retrieve_memories_tsvector(**ts_kwargs)
+                if ts_results:
+                    return ts_results
+
             try:
                 from pgvector import Vector  # adapt Python list → pgvector type
                 query_vector = Vector(query_vec)
 
                 with self._pg_conn.cursor() as cur:
-                    where_clauses: List[str] = ["1=1"]
-                    filter_params: List[Any] = []
+                    where_clauses: List[str] = [
+                        "embedding IS NOT NULL",
+                        "metadata->>'embedding_space' = %s",
+                    ]
+                    filter_params: List[Any] = [query_space]
 
                     if memory_type:
                         where_clauses.append("memory_type = %s")
                         filter_params.append(memory_type)
+
+                    if clean_uid:
+                        where_clauses.append("metadata->>'user_id' = %s")
+                        filter_params.append(clean_uid)
+                    else:
+                        where_clauses.append("metadata->>'user_id' IS NULL")
 
                     where_sql = " AND ".join(where_clauses)
                     sql = f"""
@@ -262,9 +395,11 @@ class SemanticMemoryStore:
                         if score_val < min_score:
                             continue
 
+                        meta_dict = meta if isinstance(meta, dict) else json.loads(meta or "{}")
                         results.append(
                             ExecutionMemoryItem(
                                 memory_id=mid,
+                                user_id=meta_dict.get("user_id"),
                                 goal_text=goal,
                                 plan_id=pid,
                                 session_id=sid,
@@ -273,12 +408,28 @@ class SemanticMemoryStore:
                                 outcome_status=status,
                                 execution_metrics=metrics if isinstance(metrics, dict) else json.loads(metrics or "{}"),
                                 safety_summary=safety if isinstance(safety, dict) else json.loads(safety or "{}"),
-                                metadata=meta if isinstance(meta, dict) else json.loads(meta or "{}"),
+                                metadata=meta_dict,
                                 relevance_score=round(score_val, 4),
                             )
                         )
                     results.sort(key=lambda r: r.relevance_score, reverse=True)
-                    return results[:top_k]
+                    if results:
+                        return results[:top_k]
+
+                    # If vector search returned no results, check if legacy memories exist
+                    # that can be retrieved via full-text search:
+                    ts_kwargs_fallback: Dict[str, Any] = {
+                        "goal_query": goal_query,
+                        "top_k": top_k,
+                        "min_score": min_score,
+                        "memory_type": memory_type,
+                    }
+                    if clean_uid is not None:
+                        ts_kwargs_fallback["user_id"] = clean_uid
+                    ts_results = self._retrieve_memories_tsvector(**ts_kwargs_fallback)
+                    if ts_results:
+                        return ts_results
+                    return []
             except Exception as e:
                 logger.warning(f"[SemanticMemoryStore] PG retrieve error: {e}. Using local.")
 
@@ -288,8 +439,24 @@ class SemanticMemoryStore:
             if memory_type and mem.memory_type != memory_type:
                 continue
 
+            if clean_uid:
+                mem_user = getattr(mem, "user_id", None) or (mem.metadata.get("user_id") if mem.metadata else None)
+                clean_mem_user = str(mem_user).strip() if mem_user is not None else ""
+                if not clean_mem_user or clean_mem_user != clean_uid:
+                    continue
+            else:
+                mem_user = getattr(mem, "user_id", None) or (mem.metadata.get("user_id") if mem.metadata else None)
+                if mem_user:
+                    continue
+
+            # Strict embedding-space compatibility:
+            # Exclude records without embedding_space or with incompatible embedding_space.
+            mem_space = mem.metadata.get("embedding_space")
+            if not mem_space or mem_space != query_space:
+                continue
+
             emb = self._local_embeddings.get(mid, [])
-            if not emb:
+            if not emb or len(emb) != vec_dim:
                 continue
 
             sim = self._cosine_sim(query_vec, emb)
@@ -302,6 +469,86 @@ class SemanticMemoryStore:
 
         results.sort(key=lambda r: r.relevance_score, reverse=True)
         return results[:top_k]
+
+    def _retrieve_memories_tsvector(
+        self,
+        goal_query: str,
+        top_k: int = 3,
+        min_score: float = 0.0,
+        memory_type: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> List[ExecutionMemoryItem]:
+        """
+        Retrieves memories from PostgreSQL using tsvector full-text search when
+        pgvector is dimension-incompatible with the active query embedding.
+        """
+        if not self._is_pg_connected or not self._pg_conn or not goal_query.strip():
+            return []
+        clean_ts_uid = str(user_id).strip() if user_id is not None else None
+        if user_id is not None and not clean_ts_uid:
+            return []
+        try:
+            tsv_expr = "tsv_content" if getattr(self, "_has_tsv_column", False) else "to_tsvector('english', goal_text || ' ' || COALESCE(task_summary, ''))"
+            with self._pg_conn.cursor() as cur:
+                where_clauses = [
+                    f"{tsv_expr} @@ plainto_tsquery('english', %s)",
+                    "(embedding IS NULL OR metadata->>'embedding_space' IS NULL)",
+                ]
+                filter_params: List[Any] = [goal_query]
+
+                if memory_type:
+                    where_clauses.append("memory_type = %s")
+                    filter_params.append(memory_type)
+
+                if clean_ts_uid:
+                    where_clauses.append("metadata->>'user_id' = %s")
+                    filter_params.append(clean_ts_uid)
+                else:
+                    where_clauses.append("metadata->>'user_id' IS NULL")
+
+                where_sql = " AND ".join(where_clauses)
+                sql = f"""
+                    SELECT
+                        memory_id, goal_text, plan_id, session_id, memory_type,
+                        task_summary, outcome_status, execution_metrics, safety_summary,
+                        metadata, ts_rank_cd({tsv_expr}, plainto_tsquery('english', %s)) AS text_rank,
+                        created_at
+                    FROM execution_memories
+                    WHERE {where_sql}
+                    ORDER BY text_rank DESC
+                    LIMIT %s
+                """
+                full_params = [goal_query] + filter_params + [top_k]
+                cur.execute(sql, full_params)
+                rows = cur.fetchall()
+
+                results: List[ExecutionMemoryItem] = []
+                for row in rows:
+                    mid, goal, pid, sid, mtype, summary, status, metrics, safety, meta, rank, cat = row
+                    score_val = max(0.1, min(1.0, float(rank) * 2.0 if rank > 0 else 0.1))
+                    if min_score > 0 and score_val < min_score:
+                        continue
+                    meta_dict = meta if isinstance(meta, dict) else json.loads(meta or "{}")
+                    results.append(
+                        ExecutionMemoryItem(
+                            memory_id=mid,
+                            user_id=meta_dict.get("user_id"),
+                            goal_text=goal,
+                            plan_id=pid,
+                            session_id=sid,
+                            memory_type=mtype,
+                            task_summary=summary,
+                            outcome_status=status,
+                            execution_metrics=metrics if isinstance(metrics, dict) else json.loads(metrics or "{}"),
+                            safety_summary=safety if isinstance(safety, dict) else json.loads(safety or "{}"),
+                            metadata=meta_dict,
+                            relevance_score=round(score_val, 4),
+                        )
+                    )
+                return results
+        except Exception as e:
+            logger.warning(f"[SemanticMemoryStore] tsvector retrieval error: {e}. Falling back to local.")
+            return []
 
     def count(self) -> int:
         if self._is_pg_connected and self._pg_conn:
