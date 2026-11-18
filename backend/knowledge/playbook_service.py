@@ -51,7 +51,12 @@ class PlaybookService:
         - Redacts all secrets and PII from execution steps.
         - Preserves user tenant isolation.
         """
-        # Invariant 1: ONLY learn from verified executions
+        # Invariant 1: ONLY learn from verified executions with empirical evidence and valid user identity
+        clean_uid = str(user_id or "").strip()
+        if not clean_uid:
+            logger.warning(f"[PlaybookService] Learning rejected for session {session_id}: missing user_id.")
+            return None
+
         if goal_verification.overall_status != "verified":
             logger.warning(
                 f"[PlaybookService] Learning rejected for session {session_id}: "
@@ -59,8 +64,58 @@ class PlaybookService:
             )
             return None
 
+        if not evidence_records or len(evidence_records) == 0:
+            logger.warning(
+                f"[PlaybookService] Learning rejected for session {session_id}: "
+                "no empirical evidence records provided."
+            )
+            return None
+
+        valid_evidence = []
+        for e in evidence_records:
+            if not isinstance(e, dict):
+                continue
+            if str(e.get("verification_status", "")).lower() != "verified":
+                continue
+            if e.get("session_id") and e.get("session_id") != session_id:
+                continue
+            # AUD-S3-03: Strict user ownership (no 'system' wildcard)
+            ev_uid = str(e.get("user_id") or "").strip()
+            if ev_uid and ev_uid != clean_uid:
+                continue
+            # AUD-S3-02: Strict cryptographic evidence format & payload integrity verification
+            from execution.evidence.evidence_vault import EvidenceVault
+            is_valid, reason = EvidenceVault.verify_record(e)
+            if not is_valid:
+                logger.warning(f"[PlaybookService] Evidence validation failed for record {e.get('id')}: {reason}")
+                continue
+            valid_evidence.append(e)
+        if not valid_evidence:
+            logger.warning(
+                f"[PlaybookService] Learning rejected for session {session_id}: "
+                "no verified session-bound empirical evidence records provided."
+            )
+            return None
+
         nodes = getattr(graph, "nodes", {})
         if not nodes:
+            return None
+
+        is_fallback_plan = bool(
+            getattr(graph, "is_fallback", False)
+            or (hasattr(graph, "is_fallback_plan") and callable(graph.is_fallback_plan) and graph.is_fallback_plan())
+            or (isinstance(getattr(graph, "metadata", None), dict) and graph.metadata.get("is_fallback"))
+            or getattr(getattr(graph, "metadata", None), "is_fallback", False)
+            or any(
+                isinstance(getattr(n, "metadata", None), dict) and bool(n.metadata.get("is_fallback"))
+                for n in nodes.values()
+            )
+        )
+        if is_fallback_plan:
+            logger.warning(
+                f"[PlaybookService] Learning rejected for session {session_id}: "
+                "heuristic fallback plans cannot promote into candidate playbooks."
+            )
             return None
 
         # Build clean, redacted execution steps
@@ -69,11 +124,27 @@ class PlaybookService:
         expected_outcomes: List[str] = []
 
         for tid, node in nodes.items():
+            node_status = node.status.value if hasattr(getattr(node, "status", None), "value") else str(getattr(node, "status", ""))
+            if node_status != "completed":
+                logger.warning(
+                    f"[PlaybookService] Learning rejected for session {session_id}: "
+                    f"task '{tid}' has non-completed status '{node_status}'."
+                )
+                return None
+
             tool_name = "browser"
-            if getattr(node, "tool_call", None) and hasattr(node.tool_call, "name"):
-                tool_name = str(node.tool_call.name)
+            tc = getattr(node, "tool_call", None)
+            if tc is not None:
+                if isinstance(tc, dict) and tc.get("tool_name"):
+                    tool_name = str(tc["tool_name"])
+                elif hasattr(tc, "tool_name") and getattr(tc, "tool_name", None):
+                    tool_name = str(tc.tool_name)
+                elif hasattr(tc, "name") and getattr(tc, "name", None):
+                    tool_name = str(tc.name)
             elif getattr(node, "tool_name", None):
                 tool_name = str(node.tool_name)
+            elif isinstance(getattr(node, "metadata", None), dict) and node.metadata.get("tool"):
+                tool_name = str(node.metadata["tool"])
             required_tools.add(tool_name)
 
             raw_step = {
@@ -89,15 +160,19 @@ class PlaybookService:
             steps.append(clean_step)
             expected_outcomes.append(f"{node.task_name}: completed and verified")
 
-        evidence_ids = []
-        if evidence_records:
-            evidence_ids = [e.get("id") for e in evidence_records if e.get("id")]
+        evidence_ids = [e.get("id") for e in valid_evidence if e.get("id")]
+        evidence_hashes = [e.get("artifact_hash") for e in valid_evidence if e.get("artifact_hash")]
+        if not evidence_ids:
+            evidence_ids = [f"ev_hash_{h[:12]}" for h in evidence_hashes]
 
         playbook_id = f"pb_{uuid.uuid4().hex[:12]}"
         plan_hash = getattr(graph, "plan_hash", "") or "unhashed"
 
         meta = {
             "discovered_from_session": session_id,
+            "source_plan_hash": plan_hash,
+            "supporting_evidence_hashes": evidence_hashes,
+            "is_fallback": False,
             "total_steps": len(steps),
             "verification_status": goal_verification.overall_status,
             "confidence_score": goal_verification.confidence_score,
@@ -106,7 +181,7 @@ class PlaybookService:
         auth_db = AuthDatabase.get_instance()
         doc = auth_db.record_playbook(
             id=playbook_id,
-            user_id=user_id,
+            user_id=clean_uid,
             workflow_category=category,
             goal_pattern=PrivacyRedactor.redact_text(goal_text),
             preconditions=["Network connectivity available", "Valid browser context"],
@@ -145,17 +220,30 @@ class PlaybookService:
     def get_playbooks_for_user(
         cls, user_id: str, category: Optional[str] = None, status: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        """Retrieves playbooks for a specific user, strictly respecting tenant isolation."""
+        """Retrieves playbooks for a specific user, strictly respecting tenant isolation and quarantine exclusion."""
+        clean_uid = str(user_id or "").strip()
+        if not clean_uid:
+            return []
+        if status and status.strip().lower() == "quarantined":
+            return []
         auth_db = AuthDatabase.get_instance()
-        return auth_db.get_playbooks_for_user(user_id=user_id, category=category, status=status)
+        pbs = auth_db.get_playbooks_for_user(user_id=clean_uid, category=category, status=status)
+        return [pb for pb in pbs if pb.get("status") != "quarantined" and pb.get("user_id") == clean_uid]
 
     @classmethod
     def get_playbook_by_id(
         cls, playbook_id: str, user_id: str
     ) -> Optional[Dict[str, Any]]:
-        """Retrieves a single playbook for a specific user."""
+        """Retrieves a single playbook for a specific user, excluding quarantined records."""
+        clean_pid = str(playbook_id or "").strip()
+        clean_uid = str(user_id or "").strip()
+        if not clean_pid or not clean_uid:
+            return None
         auth_db = AuthDatabase.get_instance()
-        return auth_db.get_playbook_by_id(playbook_id=playbook_id, user_id=user_id)
+        pb = auth_db.get_playbook_by_id(playbook_id=clean_pid, user_id=clean_uid)
+        if not pb or pb.get("status") == "quarantined" or pb.get("user_id") != clean_uid:
+            return None
+        return pb
 
     @classmethod
     def promote_candidate(
@@ -163,11 +251,17 @@ class PlaybookService:
     ) -> bool:
         """
         Promotes a candidate playbook to 'promoted' status for production reuse.
-        Bumps the version monotonically.
+        Bumps the version monotonically after validating ownership, verification state,
+        supporting evidence, and non-fallback provenance.
         """
+        clean_pid = str(playbook_id or "").strip()
+        clean_uid = str(user_id or "").strip()
+        if not clean_pid or not clean_uid:
+            return False
+
         auth_db = AuthDatabase.get_instance()
-        pb = auth_db.get_playbook_by_id(playbook_id, user_id=user_id)
-        if not pb:
+        pb = auth_db.get_playbook_by_id(clean_pid, user_id=clean_uid)
+        if not pb or pb.get("user_id") != clean_uid:
             logger.warning(f"[PlaybookService] Cannot promote playbook {playbook_id}: not found or unauthorized.")
             return False
 
@@ -175,7 +269,7 @@ class PlaybookService:
             logger.warning(f"[PlaybookService] Cannot promote playbook in '{pb.get('status')}' state.")
             return False
 
-        # Invariant: Reject promotion if execution outcome was unverified or confidence is insufficient
+        # Invariant: Reject promotion if execution outcome was unverified, fallback-generated, or confidence is insufficient
         conf = float(pb.get("confidence_score") or 0.0)
         pb_meta = pb.get("metadata") or {}
         if isinstance(pb_meta, str):
@@ -183,23 +277,30 @@ class PlaybookService:
                 pb_meta = json.loads(pb_meta)
             except Exception:
                 pb_meta = {}
-        verif_status = pb_meta.get("verification_status")
+        verif_status = pb_meta.get("verification_status", "verified")
+        is_fb = bool(pb_meta.get("is_fallback", False) or pb.get("is_fallback", False))
+        steps = pb.get("execution_steps") or []
 
-        if conf < 0.50 or verif_status in ("unverified", "failed", "inconclusive"):
+        if (
+            conf < 0.50
+            or verif_status in ("unverified", "failed", "inconclusive", "rejected")
+            or is_fb
+            or not steps
+        ):
             logger.warning(
-                f"[PlaybookService] Cannot promote playbook {playbook_id}: outcome was unverified "
-                f"(status='{verif_status}', confidence={conf})."
+                f"[PlaybookService] Cannot promote playbook {playbook_id}: ineligible "
+                f"(status='{verif_status}', confidence={conf}, is_fallback={is_fb}, steps={len(steps)})."
             )
             return False
 
         success = auth_db.update_playbook_status(
-            playbook_id=playbook_id,
+            playbook_id=clean_pid,
             status="promoted",
-            user_id=user_id,
+            user_id=clean_uid,
             version_increment=True,
         )
         if success:
-            logger.info(f"[PlaybookService] Promoted playbook {playbook_id} to 'promoted' for user {user_id}.")
+            logger.info(f"[PlaybookService] Promoted playbook {clean_pid} to 'promoted' for user {clean_uid}.")
         return success
 
     @classmethod
@@ -207,12 +308,37 @@ class PlaybookService:
         cls, playbook_id: str, user_id: str
     ) -> bool:
         """Marks a playbook as deprecated."""
+        clean_pid = str(playbook_id or "").strip()
+        clean_uid = str(user_id or "").strip()
+        if not clean_pid or not clean_uid:
+            return False
         auth_db = AuthDatabase.get_instance()
         return auth_db.update_playbook_status(
-            playbook_id=playbook_id,
+            playbook_id=clean_pid,
             status="deprecated",
-            user_id=user_id,
+            user_id=clean_uid,
             version_increment=False,
+        )
+
+    @classmethod
+    def record_playbook_execution_outcome(
+        cls,
+        playbook_id: str,
+        success: bool,
+        user_id: str,
+    ) -> bool:
+        """
+        Safely records the execution outcome of an approved playbook with tenant and quarantine validation.
+        """
+        clean_pid = str(playbook_id or "").strip()
+        clean_uid = str(user_id or "").strip()
+        if not clean_pid or not clean_uid:
+            return False
+        auth_db = AuthDatabase.get_instance()
+        return auth_db.record_playbook_outcome(
+            playbook_id=clean_pid,
+            success=success,
+            user_id=clean_uid,
         )
 
     @classmethod
@@ -231,10 +357,13 @@ class PlaybookService:
         3. Validates required tools against available session tools.
         4. Tags context as UNTRUSTED to prevent prompt injection or control bypass.
         """
+        clean_uid = str(user_id or "").strip()
+        if not clean_uid:
+            return []
         auth_db = AuthDatabase.get_instance()
         target_status = None if include_candidates else "promoted"
         all_pbs = auth_db.get_playbooks_for_user(
-            user_id=user_id,
+            user_id=clean_uid,
             category=category,
             status=target_status,
         )
@@ -243,6 +372,15 @@ class PlaybookService:
         matched_playbooks = []
 
         for pb in all_pbs:
+            # 0. Strict quarantine, ownership, and lifecycle exclusion
+            pb_status = str(pb.get("status", "")).lower()
+            if pb.get("user_id") != clean_uid:
+                continue
+            if pb_status in ("quarantined", "deprecated", "revoked", "rejected"):
+                continue
+            if not include_candidates and pb_status != "promoted":
+                continue
+
             # 1. Tool availability validation
             required = pb.get("required_tools", [])
             if available_tools is not None:
@@ -292,12 +430,19 @@ class PlaybookService:
 
     @classmethod
     def format_playbook_for_context(cls, playbook: Dict[str, Any]) -> str:
-        """Formats a retrieved playbook for safe, sandboxed LLM context injection."""
-        pattern = playbook.get("goal_pattern", "")
-        steps = json.dumps(playbook.get("execution_steps", []))
+        """Formats a retrieved playbook for safe, sandboxed LLM context injection with delimiter neutralization."""
+        raw_pattern = str(playbook.get("goal_pattern", ""))
+        raw_steps = json.dumps(playbook.get("execution_steps", []))
+        # Neutralize delimiter breakout tags and prompt injection control sequences
+        def _sanitize(text: str) -> str:
+            s = re.sub(r"(?i)</?\s*(?:untrusted_user_goal|untrusted_retrieved_context|system|system_instruction|instructions?|admin|root|prompt)\s*>", "[REDACTED_DELIMITER]", text)
+            s = re.sub(r"(?i)\[\s*/?\s*(?:UNTRUSTED_PLAYBOOK_CONTEXT|INST|SYS|SYSTEM)\s*\]|<\|im_start\|>|<\|im_end\|>|<<SYS>>|<</SYS>>", "[REDACTED_TOKEN]", s)
+            return s
         return (
             "[UNTRUSTED_PLAYBOOK_CONTEXT]\n"
-            f"Pattern: {pattern}\n"
-            f"Steps: {steps}\n"
+            f"PlaybookID: {playbook.get('id', 'unknown')} (v{playbook.get('version', 1)}, status={playbook.get('status', 'promoted')})\n"
+            f"ProvenanceSession: {playbook.get('provenance_session_id', 'unknown')}\n"
+            f"Pattern: {_sanitize(raw_pattern)}\n"
+            f"Steps: {_sanitize(raw_steps)}\n"
             "[/UNTRUSTED_PLAYBOOK_CONTEXT]"
         )

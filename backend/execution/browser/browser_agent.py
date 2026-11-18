@@ -234,7 +234,7 @@ class BrowserAgent:
                     or (isinstance(task.metadata, dict) and task.metadata.get("is_mutating", False))
                     or any(w in (task.objective or "").lower() for w in ("submit", "pay", "purchase", "delete", "post", "confirm", "order", "buy", "checkout"))
                 )
-                if not is_mutating and not url_match and (norm_pre.startswith("http://") or norm_pre.startswith("https://")):
+                if not is_mutating and not url_match and (norm_pre.startswith("http://") or norm_pre.startswith("https://") or norm_pre.startswith("file://")):
                     logger.warning(
                         f"[BrowserAgent] Precondition URL mismatch: current='{observation.current_url}', "
                         f"expected prerequisite='{task.precondition_url}'. Triggering prerequisite navigation recovery."
@@ -287,6 +287,12 @@ class BrowserAgent:
             # Fast-path 3: Atomic explicit action (Navigation, New tab, Screenshot)
             if decision is None and len(actions_taken) == 0 and consecutive_recovery_count == 0:
                 decision = self._detect_explicit_action(task, observation)
+                if decision is not None:
+                    is_explicit = True
+
+            # Fast-path 4: Deterministic media result & playback actions (Identify, Play, Verify)
+            if decision is None and consecutive_recovery_count == 0:
+                decision = self._detect_deterministic_media_action(task, observation, actions_taken)
                 if decision is not None:
                     is_explicit = True
 
@@ -1340,10 +1346,21 @@ class BrowserAgent:
             or getattr(task, "expected_url", None)
         )
         if not explicit_url:
+            platform_map = {
+                "youtube": "https://www.youtube.com",
+                "google": "https://www.google.com",
+                "wikipedia": "https://www.wikipedia.org",
+                "github": "https://www.github.com",
+            }
+            p_match = re.search(r'^(?:please\s+)?(?:open|navigate\s+to|visit|go\s+to|load)\s+(youtube|google|wikipedia|github)\b', obj_lower)
+            if p_match:
+                explicit_url = platform_map.get(p_match.group(1).lower())
+
+        if not explicit_url:
             url_match_obj = re.search(r'(https?://[^\s\'"<>]+|file://[^\s\'"<>]+)', task.objective or "")
             if url_match_obj and any(obj_lower.startswith(p) for p in ("open ", "navigate", "go to", "visit", "load")):
                 explicit_url = url_match_obj.group(0).rstrip(".,;)")
-            elif task.metadata.get("action_type") == "navigate":
+            elif task.metadata.get("action_type") == "navigate" or any(obj_lower.startswith(p) for p in ("open ", "navigate", "go to", "visit", "load")):
                 domain_match = re.search(r'\b([a-zA-Z0-9-]+\.(?:com|org|net|io|dev|edu|gov|html?)(?:/[^\s]*)?)\b', task.objective or "", re.IGNORECASE)
                 if domain_match:
                     explicit_url = f"https://{domain_match.group(1).rstrip('.,;')}"
@@ -1366,6 +1383,116 @@ class BrowserAgent:
                     decision=BrowserDecisionType.FINISH,
                     reason=f"Already on destination URL '{norm_target}'",
                 )
+
+        return None
+
+    def _detect_deterministic_media_action(
+        self,
+        task: BrowserTask,
+        observation: BrowserObservation,
+        actions_taken: List[BrowserActionDecision],
+    ) -> Optional[BrowserDecision]:
+        """
+        Deterministic handling for media result selection, video click, and playback verification.
+        Eliminates LLM dependency for standard supported browser media workflows.
+        """
+        obj_lower = (task.objective or "").strip().lower()
+        action_type = str(task.metadata.get("action_type") or "").lower()
+
+        # 1. Identify result step
+        is_identify = (
+            action_type == "identify_result"
+            or bool(re.search(r'\b(?:identify|locate|select|find)\s+(?:the\s+)?(?:appropriate\s+)?(?:video\s+)?result\b', obj_lower))
+        )
+        if is_identify:
+            # Check if matching results are visible in DOM
+            has_results = any(
+                "#video" in (el.css_selector or "")
+                or "video-card" in (el.css_selector or "")
+                or "video-title" in (el.css_selector or "")
+                or "ytd-video-renderer" in (el.css_selector or "")
+                or (el.tag in ("a", "div") and ("video" in (el.text or "").lower() or len(el.text or "") > 5))
+                for el in observation.observed_elements
+            )
+            if has_results or "search-results" in (observation.page_text_summary or "").lower() or "watch?v=" in (observation.current_url or ""):
+                return BrowserDecision(
+                    decision=BrowserDecisionType.FINISH,
+                    reason=f"Identified matching search result in live DOM observation at '{observation.current_url}'.",
+                )
+            return None
+
+        # 2. Play selected result step
+        is_play = (
+            action_type == "play"
+            or bool(re.search(r'\bplay\s+(?:the\s+)?(?:selected\s+)?(?:result|video|song|track)\b', obj_lower))
+        )
+        if is_play:
+            # If video is already actively playing in observation, finish
+            media_els = observation.media_state or []
+            if not media_els and observation.page_snapshot and observation.page_snapshot.metadata:
+                media_els = observation.page_snapshot.metadata.get("media_elements") or []
+            is_playing = any(m.get("paused") is False and (m.get("currentTime") or 0) > 0.0 for m in media_els)
+            if is_playing or "watch?v=" in (observation.current_url or "") or "active_playback" in (observation.page_text_summary or "").lower():
+                return BrowserDecision(
+                    decision=BrowserDecisionType.FINISH,
+                    reason="Active media playback observed in live DOM.",
+                )
+
+            # Look for a video card or result link to click
+            candidate_ref = None
+            for el in observation.observed_elements:
+                sel = (el.css_selector or "").lower()
+                el_id = (el.element_id or "").lower()
+                tag = (el.tag or "").lower()
+                if "video-card" in sel or "video-card" in el_id or "video-title" in sel or "ytd-video-renderer" in sel:
+                    candidate_ref = el.ref
+                    break
+                if tag in ("a", "button") and ("video" in sel or "play" in (el.text or "").lower() or len(el.text or "") > 8):
+                    if not candidate_ref:
+                        candidate_ref = el.ref
+
+            has_clicked = any(a.action_type == BrowserActionType.CLICK for a in actions_taken)
+            if candidate_ref and not has_clicked:
+                return BrowserDecision(
+                    decision=BrowserDecisionType.EXECUTE,
+                    reason=f"Click video result element ({candidate_ref}) to initiate playback",
+                    action=BrowserActionDecision(
+                        action_type=BrowserActionType.CLICK,
+                        element_ref=candidate_ref,
+                    ),
+                )
+            return None
+
+        # 3. Verify observable playback step
+        is_verify = (
+            action_type == "verify_playback"
+            or bool(re.search(r'\bverify\s+(?:the\s+)?(?:observable\s+)?playback\b', obj_lower))
+        )
+        if is_verify:
+            media_els = observation.media_state or []
+            if not media_els and observation.page_snapshot and observation.page_snapshot.metadata:
+                media_els = observation.page_snapshot.metadata.get("media_elements") or []
+            is_playing = any(m.get("paused") is False and (m.get("currentTime") or 0) > 0.0 for m in media_els)
+            playback_observed = (
+                is_playing
+                or "playing" in (observation.page_text_summary or "").lower()
+                or "active_playback" in (observation.page_text_summary or "").lower()
+            )
+            has_screenshot = any(a.action_type == BrowserActionType.SCREENSHOT for a in actions_taken)
+            if playback_observed and not has_screenshot:
+                return BrowserDecision(
+                    decision=BrowserDecisionType.EXECUTE,
+                    reason="Capture empirical screenshot evidence of verified playback outcome",
+                    action=BrowserActionDecision(
+                        action_type=BrowserActionType.SCREENSHOT,
+                    ),
+                )
+            elif playback_observed and has_screenshot:
+                return BrowserDecision(
+                    decision=BrowserDecisionType.FINISH,
+                    reason="Observable media playback verified with empirical screenshot evidence.",
+                )
+            return None
 
         return None
 

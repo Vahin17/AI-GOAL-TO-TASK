@@ -113,11 +113,25 @@ class ARDOTaskNode:
                 return {str(k): _ser(v) for k, v in val.items()}
             return str(val)
 
+        meta = self.metadata if isinstance(self.metadata, dict) else {}
+        st_val = self.status.value if hasattr(self.status, "value") else str(self.status)
+        verif_status = meta.get("verification_status") or ("verified" if st_val == "verified" else "unverified")
+        is_ver = bool(st_val == "verified" or verif_status == "verified")
+        art_hash = meta.get("artifact_hash") or meta.get("evidence_hash")
+        fail_reason = meta.get("failure_reason") or meta.get("cancellation_reason")
+        if not fail_reason and st_val == "failed" and self.execution_logs:
+            for log in reversed(self.execution_logs):
+                if any(w in log.lower() for w in ("fail", "error", "exception", "timeout")):
+                    fail_reason = log
+                    break
+            if not fail_reason:
+                fail_reason = self.execution_logs[-1]
+
         return {
             "task_id": self.task_id,
             "task_name": self.task_name,
             "dependency_ids": self.dependency_ids,
-            "status": self.status.value if hasattr(self.status, "value") else str(self.status),
+            "status": st_val,
             "priority_score": self.priority_score,
             "risk_score": self.risk_score,
             "retry_count": self.retry_count,
@@ -140,6 +154,11 @@ class ARDOTaskNode:
             "tool_call": _ser(self.tool_call),
             "tool_result": _ser(self.tool_result),
             "metadata": _ser(self.metadata),
+            "verification_status": verif_status,
+            "is_verified": is_ver,
+            "artifact_hash": art_hash,
+            "failure_reason": fail_reason,
+            "is_ready": bool(st_val in ("waiting", "ready")),
         }
 
 
@@ -169,6 +188,22 @@ class ARDOGraph:
     raw_nodes: List[Dict[str, Any]] = field(default_factory=list)
     raw_edges: List[Dict[str, Any]] = field(default_factory=list)
     goal_text: Optional[str] = field(default=None)
+    is_fallback: bool = field(default=False)
+    fallback_reason: Optional[str] = field(default=None)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def is_fallback_plan(self) -> bool:
+        """Determines reliably whether this graph originated from heuristic fallback planning."""
+        if self.is_fallback:
+            return True
+        if isinstance(self.metadata, dict) and self.metadata.get("is_fallback"):
+            return True
+        if getattr(self.metadata, "is_fallback", False):
+            return True
+        return any(
+            isinstance(getattr(n, "metadata", None), dict) and bool(n.metadata.get("is_fallback"))
+            for n in self.nodes.values()
+        )
 
     def get_node(self, task_id: str) -> Optional[ARDOTaskNode]:
         return self.nodes.get(task_id)
@@ -243,6 +278,9 @@ class DAGBuilder:
         context: Optional[Dict] = None,
         session_id: Optional[str] = None,
         user_id: Optional[str] = None,
+        is_fallback: bool = False,
+        fallback_reason: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> ARDOGraph:
         """
         Build and validate an ARDOGraph.
@@ -266,12 +304,23 @@ class DAGBuilder:
             ValueError: If the graph contains cycles.
         """
         graph = ARDOGraph()
+        graph_meta_input: Dict[str, Any] = {}
+        if isinstance(metadata, dict):
+            graph_meta_input = dict(metadata)
+        elif hasattr(metadata, "model_dump") and callable(metadata.model_dump):
+            graph_meta_input = metadata.model_dump()
 
         # ── 1. Create nodes ────────────────────────────────────────────────
         from orchestration.safety_schemas import ExecutionDecision, RiskLevel
         for raw in nodes_data:
-            node_id = raw["id"]
+            if not isinstance(raw, dict) or "id" not in raw or not str(raw["id"]).strip():
+                raise ValueError("ARDO DAGBuilder: Every node in nodes_data must be a dict with a non-empty 'id'.")
+            node_id = str(raw["id"]).strip()
+            if node_id in graph.nodes:
+                raise ValueError(f"ARDO DAGBuilder: Duplicate task_id '{node_id}' detected in task graph.")
             label = raw.get("data", {}).get("label", raw.get("task_name", raw.get("label", f"Task {node_id}")))
+            if not str(label).strip():
+                raise ValueError(f"ARDO DAGBuilder: Task node '{node_id}' has an empty label.")
 
             # Use SafetyDecision if provided, otherwise fall back to keyword heuristic
             decision = safety_decisions.get(node_id) if safety_decisions else None
@@ -308,18 +357,18 @@ class DAGBuilder:
 
             # Extract task metadata
             node_data = raw.get("data", {})
-            metadata = {}
+            node_meta = {}
             if isinstance(node_data, dict):
                 if "metadata" in node_data and isinstance(node_data["metadata"], dict):
-                    metadata.update(node_data["metadata"])
+                    node_meta.update(node_data["metadata"])
                 for k, v in node_data.items():
                     if k not in ("label", "metadata"):
-                        metadata[k] = v
+                        node_meta[k] = v
             if "metadata" in raw and isinstance(raw["metadata"], dict):
-                metadata.update(raw["metadata"])
+                node_meta.update(raw["metadata"])
             for k in ("destination_url", "url", "expected_url", "success_criteria", "constraints", "action_type"):
-                if k in raw and k not in metadata:
-                    metadata[k] = raw[k]
+                if k in raw and k not in node_meta:
+                    node_meta[k] = raw[k]
 
             ardo_node = ARDOTaskNode(
                 task_id=node_id,
@@ -327,9 +376,9 @@ class DAGBuilder:
                 risk_score=risk,
                 execution_mode=execution_mode,
                 approval_needed=approval_needed,
-                fallback_available=True,
+                fallback_available=bool(node_meta.get("fallback_available", False)),
                 safety_metadata=safety_meta,
-                metadata=metadata,
+                metadata=node_meta,
                 raw_type=str(raw.get("type", "default")),
             )
 
@@ -343,10 +392,22 @@ class DAGBuilder:
                         ardo_node.browser_action = raw["browser_action"]
                 else:
                     ardo_node.browser_action = raw["browser_action"]
+            raw_tc = None
             if "tool_call" in raw and raw["tool_call"] is not None:
-                ardo_node.tool_call = raw["tool_call"]
-            elif ardo_node.tool_call is None and isinstance(raw.get("data"), dict) and "tool_call" in raw["data"]:
-                ardo_node.tool_call = raw["data"]["tool_call"]
+                raw_tc = raw["tool_call"]
+            elif isinstance(raw.get("data"), dict) and raw["data"].get("tool_call") is not None:
+                raw_tc = raw["data"]["tool_call"]
+            if raw_tc is not None:
+                if isinstance(raw_tc, dict) and "tool_name" in raw_tc and "action_name" in raw_tc:
+                    try:
+                        from execution.registry.tool_models import ToolCall
+                        tc_kwargs = dict(raw_tc)
+                        tc_kwargs.setdefault("call_id", f"call_{node_id}")
+                        ardo_node.tool_call = ToolCall(**tc_kwargs)
+                    except Exception:
+                        ardo_node.tool_call = raw_tc
+                else:
+                    ardo_node.tool_call = raw_tc
 
             if start_blocked:
                 from orchestration.state_machine import TaskState as _TS
@@ -363,12 +424,17 @@ class DAGBuilder:
         for edge in edges_data:
             src = edge["source"]
             tgt = edge["target"]
-            if src in graph.adjacency and tgt in graph.nodes:
+            if src not in graph.nodes or tgt not in graph.nodes:
+                raise ValueError(
+                    f"ARDO DAGBuilder: Edge '{src}' -> '{tgt}' references nonexistent task node."
+                )
+            if tgt not in graph.adjacency[src]:
                 graph.adjacency[src].append(tgt)
+            if src not in graph.reverse_adj[tgt]:
                 graph.reverse_adj[tgt].append(src)
-                # dependency_ids on the target node
-                if src not in graph.nodes[tgt].dependency_ids:
-                    graph.nodes[tgt].dependency_ids.append(src)
+            # dependency_ids on the target node
+            if src not in graph.nodes[tgt].dependency_ids:
+                graph.nodes[tgt].dependency_ids.append(src)
 
         # ── 3. Cycle detection ─────────────────────────────────────────────
         if DAGBuilder._has_cycle(graph):
@@ -404,6 +470,25 @@ class DAGBuilder:
         graph.raw_nodes = nodes_data
         graph.raw_edges = edges_data
         graph.goal_text = goal_text
+
+        derived_fallback = bool(is_fallback) or any(
+            isinstance(getattr(n, "metadata", None), dict) and bool(n.metadata.get("is_fallback"))
+            for n in graph.nodes.values()
+        )
+        if not derived_fallback and graph_meta_input.get("is_fallback"):
+            derived_fallback = True
+        graph.is_fallback = derived_fallback
+        graph.fallback_reason = fallback_reason or graph_meta_input.get("fallback_reason")
+        graph.metadata = dict(graph_meta_input)
+        graph.metadata["is_fallback"] = graph.is_fallback
+        if graph.fallback_reason:
+            graph.metadata["fallback_reason"] = graph.fallback_reason
+        if "planning_mode" not in graph.metadata:
+            graph.metadata["planning_mode"] = "deterministic_fallback" if graph.is_fallback else "primary_ai"
+        if "validation_passed" not in graph.metadata:
+            graph.metadata["validation_passed"] = True
+        if "limitations" not in graph.metadata:
+            graph.metadata["limitations"] = []
 
         logger.info(
             f"[DAGBuilder] Graph built: {len(graph.nodes)} nodes, "

@@ -72,11 +72,24 @@ export default function ChatPanel() {
 
     try {
       await startSession({ goal: textToSend, mode: selectedMode });
-      addMessage({ 
-        role: 'assistant', 
-        content: `Target objective analyzed and compiled into ARDO task DAG. Real-time orchestration active in ${selectedMode.toUpperCase()} mode.` 
-      });
-      addLog(`Reasoning Engine: ARDO session initialized successfully.`);
+      const { isFallbackPlan, fallbackReason, planningLimitations } = useARDOStore.getState();
+      if (isFallbackPlan) {
+        const limitText =
+          planningLimitations && planningLimitations.length > 0
+            ? ` Limitations: ${planningLimitations.join(' ')}`
+            : '';
+        addMessage({
+          role: 'assistant',
+          content: `Fallback planning was used because the primary AI planning provider was unavailable or rejected (${fallbackReason || 'rule-based fallback engaged'}). This plan passed structural validation in ${selectedMode.toUpperCase()} mode.${limitText}`,
+        });
+        addLog(`Fallback Planner Engaged: ${fallbackReason || 'Deterministic rule-based plan compiled.'}`);
+      } else {
+        addMessage({ 
+          role: 'assistant', 
+          content: `Target objective analyzed by Primary AI Planner and compiled into ARDO task DAG. Real-time orchestration active in ${selectedMode.toUpperCase()} mode.` 
+        });
+        addLog(`Primary AI Planner: ARDO session initialized successfully.`);
+      }
     } catch (err: any) {
       const msg = err?.message || String(err);
       const cleanMsg = msg.replace(/^Error:\s*/, '');

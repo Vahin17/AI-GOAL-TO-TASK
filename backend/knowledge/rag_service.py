@@ -236,14 +236,18 @@ class RAGService:
         source: str = "manual_input",
         category: str = "general",
         metadata: Optional[Dict[str, Any]] = None,
+        user_id: Optional[str] = None,
     ) -> IngestionReport:
-        """Helper to ingest a single raw text document."""
+        """Helper to ingest a single raw text document with optional tenant scoping."""
+        doc_meta = dict(metadata or {})
+        if user_id is not None and str(user_id).strip():
+            doc_meta["user_id"] = str(user_id).strip()
         doc = Document(
             title=title,
             content=content,
             source=source,
             category=category,
-            metadata=metadata or {},
+            metadata=doc_meta,
         )
         return self.ingest_documents([doc])
 
@@ -257,30 +261,63 @@ class RAGService:
     ) -> Tuple[str, KnowledgeProvenance]:
         """
         Main interface called during task planning:
-        1. Retrieves matching static knowledge chunks (Playbooks/SOPs)
-        2. Retrieves relevant past execution memories (if enabled)
+        1. Retrieves matching static knowledge chunks (Playbooks/SOPs) with tenant scoping
+        2. Retrieves relevant past execution memories (if enabled) with tenant isolation
         3. Formats them as structured markdown context
         """
+        viewer_uid = str(user_id).strip() if user_id is not None else ""
         knowledge_res = self.retriever.retrieve(
             query=goal_text,
             top_k=top_k,
             min_score=min_score,
+            filter_metadata={"_viewer_user_id": viewer_uid},
         )
 
-        clean_user = str(user_id).strip() if user_id is not None else ""
         memories: List[ExecutionMemoryItem] = []
-        if include_memory and self.memory_store and clean_user:
-            try:
-                memories = self.memory_store.retrieve_memories(
-                    goal_query=goal_text,
-                    top_k=2,
-                    min_score=min_score or 0.35,
-                    user_id=clean_user,
-                )
-            except Exception as e:
-                logger.warning(f"[RAGService] Memory retrieval warning: {e}")
+        memory_error = False
+        if include_memory and self.memory_store:
+            if user_id is not None and not viewer_uid:
+                logger.warning("[RAGService] Skipping memory retrieval for empty/whitespace user_id.")
+            else:
+                try:
+                    memories = self.memory_store.retrieve_memories(
+                        goal_query=goal_text,
+                        top_k=2,
+                        min_score=min_score or 0.35,
+                        user_id=viewer_uid if user_id is not None else None,
+                    )
+                except Exception as e:
+                    logger.warning(f"[RAGService] Memory retrieval warning: {e}")
+                    memory_error = True
 
-        return self.assembler.assemble(knowledge_res, memories=memories)
+        # 3. AUD-S3-01: Retrieve matching promoted playbooks with tenant isolation
+        playbooks: List[Dict[str, Any]] = []
+        if viewer_uid:
+            try:
+                from knowledge.playbook_service import PlaybookService
+                from execution.registry.tool_registry import ToolRegistry
+                available_tools = None
+                try:
+                    registry = ToolRegistry.get_instance()
+                    available_tools = set(registry.get_registered_tool_names())
+                except Exception:
+                    available_tools = None
+
+                playbooks = PlaybookService.retrieve_playbooks_for_goal(
+                    goal_text=goal_text,
+                    user_id=viewer_uid,
+                    available_tools=available_tools,
+                    include_candidates=False,
+                )
+            except Exception as pb_err:
+                logger.warning(f"[RAGService] Playbook retrieval warning: {pb_err}")
+
+        context_str, provenance = self.assembler.assemble(
+            knowledge_res, memories=memories, playbooks=playbooks
+        )
+        if memory_error:
+            provenance.retrieval_status = "error"
+        return context_str, provenance
 
     def record_plan_outcome(
         self,

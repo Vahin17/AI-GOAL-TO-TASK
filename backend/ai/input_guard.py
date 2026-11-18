@@ -44,6 +44,20 @@ class InputGuardResult(BaseModel):
     requires_review: bool = Field(default=False, description="True if verdict is review")
 
 
+class InputDeniedError(ValueError):
+    """Raised when InputGuard denies a goal (HTTP 400)."""
+    def __init__(self, message: str, guard_result: Optional[InputGuardResult] = None):
+        super().__init__(message)
+        self.guard_result = guard_result
+
+
+class InputReviewRequiredError(ValueError):
+    """Raised when InputGuard determines a goal requires user review or clarification (HTTP 422)."""
+    def __init__(self, message: str, guard_result: Optional[InputGuardResult] = None):
+        super().__init__(message)
+        self.guard_result = guard_result
+
+
 class InputGuard:
     """
     Validates and sanitizes incoming user goals for the ARDO planning engine.
@@ -314,6 +328,20 @@ class InputGuard:
             elif medium_matches > 1 and risk_score < 0.9:
                 risk_score = max(risk_score, 0.7)
 
+        # 4b. Ambiguity / Targetless Directive Detection
+        has_ambiguous_target = False
+        ambiguous_pattern = re.compile(
+            r"^\s*(?:please\s+)?(?:do|fix|run|update|open|click|check|verify|execute|process|complete|handle|solve|start|launch)\s+"
+            r"(?:it|this|that|them|something|everything|anything|the\s+thing|the\s+task|the\s+request|all\s+of\s+it)\s*[.!?]*\s*$",
+            re.IGNORECASE,
+        )
+        if ambiguous_pattern.match(stripped):
+            has_ambiguous_target = True
+            if "ambiguous_goal_target" not in flagged:
+                flagged.append("ambiguous_goal_target")
+            if risk_score < 0.8:
+                risk_score = max(risk_score, 0.45)
+
         # 5. Determine Verdict
         if risk_score >= 0.8:
             verdict = InputGuardVerdict.DENY
@@ -324,6 +352,8 @@ class InputGuard:
             verdict = InputGuardVerdict.REVIEW
             if has_quoted_high_injection:
                 reason = f"Review required: Goal contains quoted prompt instruction literals ({', '.join(flagged)}). Clarification required before execution."
+            elif has_ambiguous_target:
+                reason = "Review required: Goal is ambiguous and lacks a concrete target, URL, or resource (ambiguous_goal_target). Clarification required before execution."
             else:
                 reason = f"Review advised: Suspicious meta-prompt keywords detected ({', '.join(flagged)}). Clarification required before execution."
             is_valid = True

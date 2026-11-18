@@ -180,6 +180,17 @@ class ARDOSession:
         if hasattr(self, "engine") and self.engine is not None:
             await self.engine.pause(reason=reason, cooldown_seconds=cooldown_seconds)
 
+    async def cancel(self, reason: str = "manual") -> None:
+        """Cancels the underlying runtime engine cleanly."""
+        if hasattr(self, "engine") and self.engine is not None:
+            await self.engine.cancel(reason=reason)
+
+    @property
+    def is_cancelled(self) -> bool:
+        if hasattr(self, "engine") and self.engine is not None:
+            return getattr(self.engine, "is_cancelled", False)
+        return False
+
     def resume(self) -> bool:
         """Resumes the underlying runtime engine if eligible."""
         if hasattr(self, "engine") and self.engine is not None:
@@ -198,8 +209,14 @@ class ARDOSession:
     def get_evidence(self) -> dict:
         """Collect browser and execution evidence from EvidenceVault and graph nodes."""
         from execution.evidence.evidence_vault import EvidenceVault
-        vault_records = EvidenceVault.get_session_evidence(self.session_id, self.user_id or "system")
-        vault_by_task = {r.get("task_id"): r for r in vault_records}
+        expected_user = self.user_id or "system"
+        raw_vault_records = EvidenceVault.get_session_evidence(self.session_id, expected_user)
+        vault_records = [
+            r for r in raw_vault_records
+            if r.get("session_id") == self.session_id
+            and (not r.get("user_id") or r.get("user_id") == expected_user)
+        ]
+        vault_by_task = {r.get("task_id"): r for r in vault_records if r.get("task_id")}
 
         evidence_items = []
         for task_id, node in self.graph.nodes.items():
@@ -240,14 +257,34 @@ class ARDOSession:
                     action_data["value"] = "********"
 
                 vr = vault_by_task.get(task_id, {})
+                node_meta = node.metadata if isinstance(node.metadata, dict) else {}
+
+                # Never infer 'verified' merely from node.status == 'completed'
+                v_status = vr.get("verification_status") or node_meta.get("verification_status")
+                if not v_status and getattr(node, "browser_result", None) and getattr(node.browser_result, "verification", None):
+                    bv = node.browser_result.verification
+                    v_status = bv.status.value if hasattr(bv.status, "value") else str(bv.status)
+                if not v_status:
+                    v_status = "unverified" if node.status.value == "completed" else node.status.value
+
+                # Never default missing or 0.0 confidence to 1.0
+                raw_conf = vr.get("confidence_score")
+                if raw_conf is None:
+                    raw_conf = node_meta.get("confidence_score")
+                if raw_conf is None and getattr(node, "browser_result", None) and getattr(node.browser_result, "verification", None):
+                    raw_conf = getattr(node.browser_result.verification, "confidence_score", None)
+                conf_score = float(raw_conf) if raw_conf is not None else 0.0
+
                 evidence_items.append({
                     "id": vr.get("id"),
+                    "session_id": self.session_id,
+                    "user_id": expected_user,
                     "task_id": task_id,
                     "task_name": node.task_name,
-                    "status": vr.get("verification_status") or node.status.value,
-                    "verification_status": vr.get("verification_status") or ("verified" if node.status.value == "completed" else node.status.value),
-                    "artifact_hash": vr.get("artifact_hash") or (node.metadata.get("artifact_hash") if node.metadata else None),
-                    "confidence_score": vr.get("confidence_score") or (node.metadata.get("confidence_score") if node.metadata else 1.0),
+                    "status": v_status,
+                    "verification_status": v_status,
+                    "artifact_hash": vr.get("artifact_hash") or node_meta.get("artifact_hash"),
+                    "confidence_score": conf_score,
                     "captured_at": vr.get("captured_at"),
                     "action": action_data,
                     "result": result_data,
@@ -259,15 +296,20 @@ class ARDOSession:
         recorded_tasks = {e["task_id"] for e in evidence_items}
         for vr in vault_records:
             tid = vr.get("task_id")
-            if tid not in recorded_tasks:
+            if tid and tid not in recorded_tasks:
+                v_stat = vr.get("verification_status") or "unverified"
+                raw_c = vr.get("confidence_score")
+                c_val = float(raw_c) if raw_c is not None else 0.0
                 evidence_items.append({
                     "id": vr.get("id"),
+                    "session_id": self.session_id,
+                    "user_id": expected_user,
                     "task_id": tid,
                     "task_name": vr.get("task_name", tid),
-                    "status": vr.get("verification_status", "verified"),
-                    "verification_status": vr.get("verification_status", "verified"),
+                    "status": v_stat,
+                    "verification_status": v_stat,
                     "artifact_hash": vr.get("artifact_hash"),
-                    "confidence_score": vr.get("confidence_score", 1.0),
+                    "confidence_score": c_val,
                     "captured_at": vr.get("captured_at"),
                     "action": {},
                     "result": {},
@@ -329,6 +371,9 @@ class ARDOScheduler:
         db=None,
         safety_decisions: Optional[dict] = None,
         user_id: Optional[str] = None,
+        is_fallback: bool = False,
+        fallback_reason: Optional[str] = None,
+        planning_metadata: Optional[Dict[str, Any]] = None,
     ) -> ARDOSession:
         """
         Build a DAG from plan data and launch an ARDO orchestration session.
@@ -358,6 +403,11 @@ class ARDOScheduler:
             execution_mode=mode,
             safety_decisions=safety_decisions,
             goal_text=goal_id or "",
+            session_id=session_id,
+            user_id=user_id,
+            is_fallback=is_fallback,
+            fallback_reason=fallback_reason,
+            metadata=planning_metadata,
         )
         graph.session_id = session_id
 
@@ -431,6 +481,11 @@ class ARDOScheduler:
                 nodes_data=plan_nodes,
                 edges_data=plan_edges,
                 goal_text=checkpoint.get("session_id", ""),
+                session_id=session_id,
+                user_id=clean_user,
+                is_fallback=bool(checkpoint.get("is_fallback", False)),
+                fallback_reason=checkpoint.get("fallback_reason"),
+                metadata=checkpoint.get("graph_metadata") or {},
             )
             graph.session_id = session_id
 
@@ -508,8 +563,25 @@ class ARDOScheduler:
     @classmethod
     def list_active_sessions(cls, user_id: Optional[str] = None) -> List[str]:
         if user_id is not None:
-            return [sid for sid, s in cls._sessions.items() if s.user_id == user_id]
+            clean_u = str(user_id or "").strip()
+            if not clean_u:
+                return []
+            return [sid for sid, s in cls._sessions.items() if str(s.user_id or "").strip() == clean_u]
         return list(cls._sessions.keys())
+
+    @classmethod
+    async def cancel_session(
+        cls,
+        session_id: str,
+        reason: str = "manual",
+        user_id: Optional[str] = None,
+    ) -> bool:
+        """Safely cancels an active session and updates its task statuses."""
+        session = cls.get_session(session_id, user_id=user_id)
+        if not session:
+            return False
+        await session.cancel(reason=reason)
+        return True
 
     @classmethod
     async def pause_session(
@@ -660,29 +732,40 @@ class ARDOScheduler:
 
     @classmethod
     def get_history(cls, user_id: Optional[str] = None) -> List[dict]:
-        """Return history of execution sessions with enriched current states, scoped by user_id."""
+        """Return history of execution sessions with enriched current states, strictly scoped by user_id."""
+        clean_user = str(user_id or "").strip() if user_id is not None else None
+        if user_id is not None and not clean_user:
+            return []
         history = []
         for item in cls._session_history:
-            # Multi-user isolation filter: if user_id is provided, only return user's records
-            if user_id is not None and item.get("user_id") is not None and item.get("user_id") != user_id:
+            item_user = str(item.get("user_id") or "").strip()
+            if clean_user is not None and item_user != clean_user:
                 continue
-            session = cls.get_session(item["session_id"], user_id=user_id)
+            session = cls.get_session(item["session_id"], user_id=clean_user)
             if session:
+                session.engine.monitor.update_counts_from_graph(session.engine.graph)
                 metrics = session.engine.monitor.get_metrics()
                 item_copy = dict(item)
                 item_copy["duration_seconds"] = round(metrics.get("elapsed_seconds", 0.0), 2)
                 item_copy["tasks_completed"] = metrics.get("tasks_completed", 0)
+                item_copy["tasks_verified"] = metrics.get("tasks_verified", 0)
                 item_copy["tasks_failed"] = metrics.get("tasks_failed", 0)
                 item_copy["tasks_blocked"] = metrics.get("tasks_blocked", 0)
-                if metrics.get("tasks_completed", 0) == item.get("task_count", 0) and item.get("task_count", 0) > 0:
+                item_copy["tasks_cancelled"] = metrics.get("tasks_cancelled", 0)
+                t_total = item.get("task_count", 0) or metrics.get("tasks_total", 0)
+                if metrics.get("tasks_verified", 0) == t_total and t_total > 0:
+                    item_copy["status"] = "verified"
+                elif (metrics.get("tasks_completed", 0) + metrics.get("tasks_verified", 0)) == t_total and t_total > 0:
                     item_copy["status"] = "completed"
                 elif metrics.get("tasks_blocked", 0) > 0:
                     item_copy["status"] = "blocked"
+                elif metrics.get("tasks_cancelled", 0) > 0:
+                    item_copy["status"] = "cancelled"
                 elif metrics.get("tasks_failed", 0) > 0:
                     item_copy["status"] = "failed"
                 history.append(item_copy)
             else:
-                history.append(item)
+                history.append(dict(item))
         return history
 
     @classmethod

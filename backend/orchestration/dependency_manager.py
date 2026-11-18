@@ -84,23 +84,32 @@ class DependencyManager:
     @staticmethod
     def get_blocked_by_failure(graph: "ARDOGraph") -> List[str]:
         """
-        Return tasks that are now blocked because at least one predecessor
-        has FAILED or BLOCKED status (and no fallback).
+        Return all tasks that are blocked because at least one predecessor
+        has FAILED or BLOCKED status (and no fallback), computed as a
+        transitive closure across the DAG.
         """
-        newly_blocked: List[str] = []
-        for task_id, node in graph.nodes.items():
-            if node.status in (
-                TaskState.COMPLETED, TaskState.BLOCKED, TaskState.FAILED
-            ):
-                continue
-            for dep_id in node.dependency_ids:
-                dep_node = graph.get_node(dep_id)
-                if dep_node and dep_node.status in (
-                    TaskState.FAILED, TaskState.BLOCKED
-                ) and not dep_node.fallback_available:
-                    newly_blocked.append(task_id)
-                    break
-        return newly_blocked
+        blocked_set: Set[str] = set()
+        failing_or_blocked: Set[str] = {
+            tid for tid, n in graph.nodes.items()
+            if n.status in (TaskState.FAILED, TaskState.BLOCKED)
+            and not getattr(n, "fallback_available", False)
+        }
+
+        changed = True
+        while changed:
+            changed = False
+            for task_id, node in graph.nodes.items():
+                if node.status in (TaskState.COMPLETED, TaskState.VERIFIED, TaskState.BLOCKED, TaskState.FAILED):
+                    continue
+                if task_id in blocked_set:
+                    continue
+                for dep_id in node.dependency_ids:
+                    if dep_id in failing_or_blocked or dep_id in blocked_set:
+                        blocked_set.add(task_id)
+                        changed = True
+                        break
+
+        return list(blocked_set)
 
     @staticmethod
     def get_parallel_ready_groups(graph: "ARDOGraph") -> List[List[str]]:
@@ -158,12 +167,12 @@ class DependencyManager:
 
     @staticmethod
     def _all_deps_completed(task_id: str, graph: "ARDOGraph") -> bool:
-        """Returns True if all predecessor nodes are in COMPLETED state."""
+        """Returns True if all predecessor nodes are in COMPLETED or VERIFIED state."""
         node = graph.get_node(task_id)
         if not node:
             return False
         for dep_id in node.dependency_ids:
             dep_node = graph.get_node(dep_id)
-            if not dep_node or dep_node.status != TaskState.COMPLETED:
+            if not dep_node or dep_node.status not in (TaskState.COMPLETED, TaskState.VERIFIED):
                 return False
         return True

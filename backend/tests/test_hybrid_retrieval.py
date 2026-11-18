@@ -149,17 +149,17 @@ def test_search_mode_dispatch_in_retriever(hybrid_store):
     retriever = KnowledgeRetriever(vector_store=hybrid_store, default_top_k=2)
 
     # 1. Keyword mode
-    kw_res = retriever.retrieve("Playwright page.goto", search_mode="keyword")
+    kw_res = retriever.retrieve("Playwright page.goto", filter_metadata={"user_id": "tenant_1"}, search_mode="keyword")
     assert kw_res.status == "success"
     assert any(c.chunk_id == "chunk_browser_nav" for c in kw_res.chunks)
 
     # 2. Vector mode
-    vec_res = retriever.retrieve("Argon2id password authentication flow", min_score=0.2, search_mode="vector")
+    vec_res = retriever.retrieve("Argon2id password authentication flow", min_score=0.2, filter_metadata={"user_id": "tenant_1"}, search_mode="vector")
     assert vec_res.status == "success"
     assert len(vec_res.chunks) > 0
 
     # 3. Hybrid mode (default)
-    hyb_res = retriever.retrieve("Argon2id password hashing")
+    hyb_res = retriever.retrieve("Argon2id password hashing", filter_metadata={"user_id": "tenant_1"})
     assert hyb_res.status == "success"
     assert hyb_res.chunks[0].metadata.get("retrieval_mode") == "hybrid"
 

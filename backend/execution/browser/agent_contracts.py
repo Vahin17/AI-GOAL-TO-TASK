@@ -503,7 +503,11 @@ class GoalVerificationResult(BaseModel):
     confidence_score: float = Field(default=0.0, ge=0.0, le=1.0)
     total_tasks: int = 0
     verified_tasks: int = 0
+    completed_unverified_tasks: int = 0
     failed_tasks: int = 0
+    blocked_tasks: int = 0
+    pending_tasks: int = 0
+    ready_tasks: int = 0
     inconclusive_tasks: int = 0
     supporting_evidence_hashes: List[str] = Field(default_factory=list)
     explanation: str = ""
@@ -516,7 +520,11 @@ class GoalVerificationResult(BaseModel):
             "confidence_score": self.confidence_score,
             "total_tasks": self.total_tasks,
             "verified_tasks": self.verified_tasks,
+            "completed_unverified_tasks": self.completed_unverified_tasks,
             "failed_tasks": self.failed_tasks,
+            "blocked_tasks": self.blocked_tasks,
+            "pending_tasks": self.pending_tasks,
+            "ready_tasks": self.ready_tasks,
             "inconclusive_tasks": self.inconclusive_tasks,
             "supporting_evidence_hashes": self.supporting_evidence_hashes,
             "explanation": self.explanation,
@@ -623,6 +631,15 @@ class BrowserAgentResult(BaseModel):
         return self.outcome in (
             BrowserAgentOutcome.COMPLETED,
             BrowserAgentOutcome.COMPLETED_UNVERIFIED,
+        )
+
+    @property
+    def success(self) -> bool:
+        """True only when the task completed AND achieved verified status."""
+        return (
+            self.outcome == BrowserAgentOutcome.COMPLETED
+            and self.verification is not None
+            and self.verification.status == BrowserVerificationStatus.VERIFIED
         )
 
     def to_dict(self) -> dict:

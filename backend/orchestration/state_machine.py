@@ -33,12 +33,16 @@ logger = logging.getLogger(__name__)
 class TaskState(str, Enum):
     PENDING          = "pending"
     WAITING          = "waiting"
+    READY            = "ready"
     ACTIVE           = "active"
     RETRYING         = "retrying"
     COMPLETED        = "completed"
+    VERIFIED         = "verified"
     FAILED           = "failed"
     BLOCKED          = "blocked"
     APPROVAL_NEEDED  = "approval_needed"
+    PAUSED           = "paused"
+    CANCELLED        = "cancelled"
     OUTCOME_UNKNOWN  = "outcome_unknown"
 
 
@@ -46,43 +50,77 @@ class TaskState(str, Enum):
 _VALID_TRANSITIONS: Dict[TaskState, Set[TaskState]] = {
     TaskState.PENDING: {
         TaskState.WAITING,
+        TaskState.READY,
         TaskState.APPROVAL_NEEDED,
+        TaskState.PAUSED,
+        TaskState.CANCELLED,
     },
     TaskState.WAITING: {
         TaskState.ACTIVE,
+        TaskState.READY,
         TaskState.BLOCKED,
+        TaskState.PAUSED,
+        TaskState.CANCELLED,
+    },
+    TaskState.READY: {
+        TaskState.ACTIVE,
+        TaskState.BLOCKED,
+        TaskState.PAUSED,
+        TaskState.CANCELLED,
     },
     TaskState.ACTIVE: {
         TaskState.COMPLETED,
+        TaskState.VERIFIED,
         TaskState.FAILED,
         TaskState.RETRYING,
         TaskState.APPROVAL_NEEDED,
         TaskState.OUTCOME_UNKNOWN,
+        TaskState.PAUSED,
+        TaskState.CANCELLED,
     },
     TaskState.RETRYING: {
         TaskState.ACTIVE,
         TaskState.FAILED,
         TaskState.OUTCOME_UNKNOWN,
+        TaskState.PAUSED,
+        TaskState.CANCELLED,
     },
     TaskState.FAILED: {
         TaskState.BLOCKED,
     },
     TaskState.APPROVAL_NEEDED: {
         TaskState.WAITING,
+        TaskState.READY,
         TaskState.ACTIVE,
         TaskState.BLOCKED,
         TaskState.COMPLETED,
+        TaskState.VERIFIED,
+        TaskState.PAUSED,
+        TaskState.CANCELLED,
+    },
+    TaskState.PAUSED: {
+        TaskState.WAITING,
+        TaskState.READY,
+        TaskState.ACTIVE,
+        TaskState.CANCELLED,
     },
     TaskState.OUTCOME_UNKNOWN: {
         TaskState.COMPLETED,
+        TaskState.VERIFIED,
         TaskState.WAITING,
+        TaskState.READY,
         TaskState.APPROVAL_NEEDED,
         TaskState.FAILED,
         TaskState.BLOCKED,
+        TaskState.CANCELLED,
     },
-    # Terminal states — no outgoing transitions
-    TaskState.COMPLETED: set(),
+    TaskState.COMPLETED: {
+        TaskState.VERIFIED,
+    },
+    # Terminal states
+    TaskState.VERIFIED:  set(),
     TaskState.BLOCKED:   set(),
+    TaskState.CANCELLED: set(),
 }
 
 
@@ -151,8 +189,8 @@ class TaskStateMachine:
 
     @staticmethod
     def is_terminal(state: TaskState) -> bool:
-        """Returns True if the state has no valid outgoing transitions."""
-        return len(_VALID_TRANSITIONS.get(state, set())) == 0
+        """Returns True if the state is terminal (completed, verified, failed, blocked, cancelled)."""
+        return state in (TaskState.COMPLETED, TaskState.VERIFIED, TaskState.FAILED, TaskState.BLOCKED, TaskState.CANCELLED)
 
     @staticmethod
     def is_active_or_retrying(state: TaskState) -> bool:
@@ -160,11 +198,11 @@ class TaskStateMachine:
 
     @staticmethod
     def is_complete(state: TaskState) -> bool:
-        return state == TaskState.COMPLETED
+        return state in (TaskState.COMPLETED, TaskState.VERIFIED)
 
     @staticmethod
     def is_failed_or_blocked(state: TaskState) -> bool:
-        return state in (TaskState.FAILED, TaskState.BLOCKED)
+        return state in (TaskState.FAILED, TaskState.BLOCKED, TaskState.CANCELLED)
 
     @staticmethod
     def get_allowed_transitions(state: TaskState) -> Tuple[TaskState, ...]:

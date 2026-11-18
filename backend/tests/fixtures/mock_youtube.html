@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mock YouTube - ARDO Offline Acceptance Fixture</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: Roboto, Arial, sans-serif; background-color: #0f0f0f; color: #f1f1f1; }
+        header { display: flex; align-items: center; justify-content: space-between; padding: 12px 24px; background: #0f0f0f; border-bottom: 1px solid #272727; position: sticky; top: 0; z-index: 100; }
+        .logo { display: flex; align-items: center; gap: 8px; font-weight: bold; font-size: 18px; color: #fff; cursor: pointer; }
+        .logo-badge { background: #ff0000; color: #fff; padding: 2px 6px; border-radius: 4px; font-size: 12px; font-weight: 900; }
+        .search-box { display: flex; width: 50%; max-width: 600px; }
+        .search-box input { flex: 1; padding: 10px 16px; background: #121212; border: 1px solid #303030; border-right: none; border-radius: 20px 0 0 20px; color: #fff; font-size: 14px; outline: none; }
+        .search-box input:focus { border-color: #1c62b9; }
+        .search-box button { padding: 10px 24px; background: #222222; border: 1px solid #303030; border-radius: 0 20px 20px 0; color: #fff; cursor: pointer; }
+        .search-box button:hover { background: #272727; }
+        main { padding: 24px; max-width: 1200px; margin: 0 auto; }
+        #search-results { display: none; margin-top: 16px; flex-direction: column; gap: 16px; }
+        .video-card { display: flex; gap: 16px; background: #181818; padding: 12px; border-radius: 12px; cursor: pointer; border: 1px solid transparent; transition: border-color 0.2s; }
+        .video-card:hover { border-color: #3ea6ff; }
+        .thumbnail { width: 240px; height: 135px; background: #2a2a2a; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 24px; color: #ff0000; }
+        .video-info { display: flex; flex-direction: column; gap: 6px; }
+        .video-title { font-size: 18px; font-weight: 600; color: #f1f1f1; text-decoration: none; }
+        .channel-name { font-size: 13px; color: #aaa; }
+        .video-meta { font-size: 12px; color: #717171; }
+        #player-container { display: none; margin-bottom: 24px; background: #000; border-radius: 12px; overflow: hidden; }
+        .video-viewport { width: 100%; height: 480px; background: #000; position: relative; display: flex; align-items: center; justify-content: center; }
+        .playback-badge { position: absolute; top: 16px; left: 16px; background: rgba(0,200,83,0.9); color: #000; font-weight: bold; padding: 6px 12px; border-radius: 4px; font-size: 13px; }
+        .player-info { padding: 16px; background: #1f1f1f; }
+        .now-playing-title { font-size: 20px; font-weight: bold; }
+        .playback-controls { margin-top: 8px; display: flex; align-items: center; gap: 16px; }
+        .play-btn { background: #ff0000; border: none; padding: 8px 18px; color: white; border-radius: 4px; font-weight: bold; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="logo" id="home-link">
+            <span class="logo-badge">PLAY</span>
+            <span>YouTube Fixture</span>
+        </div>
+        <div class="search-box">
+            <input 
+                type="text" 
+                id="search" 
+                name="search_query" 
+                placeholder="Search" 
+                autocomplete="off" 
+            />
+            <button id="search-icon-legacy" aria-label="Search" onclick="performSearch()">
+                🔍
+            </button>
+        </div>
+        <div style="width: 80px;"></div>
+    </header>
+
+    <main>
+        <!-- Video Player View (initially hidden) -->
+        <div id="player-container">
+            <div class="video-viewport" id="movie_player">
+                <div class="playback-badge" id="playback-status">PAUSED</div>
+                <div id="video-visual" style="font-size: 48px;">🎵</div>
+                <video id="video-element" class="html5-main-video" style="display:none;"></video>
+            </div>
+            <div class="player-info">
+                <h1 class="now-playing-title" id="video-title-display"></h1>
+                <div class="playback-controls">
+                    <button class="play-btn" id="play-pause-btn" onclick="togglePlay()">Play</button>
+                    <span id="current-time">0:01 / 4:32</span>
+                    <span id="player-status-tag" style="color: #4ade80; font-weight: bold;">ACTIVE_PLAYBACK</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Search Results List -->
+        <div id="results-heading" style="display: none; margin-bottom: 12px; font-size: 14px; color: #aaa;">
+            Search Results for "<span id="results-query"></span>"
+        </div>
+
+        <div id="search-results">
+            <!-- Results dynamically inserted or pre-rendered -->
+            <div class="video-card" id="video-card-1" role="button" aria-label="Play Ye Fitoor Mera Official Song" onclick="playVideo('Ye Fitoor Mera (Official Song) | Fitoor | Arijit Singh | Amit Trivedi', 'Zee Music Company')">
+                <div class="thumbnail">▶</div>
+                <div class="video-info">
+                    <h3 class="video-title" id="video-title-1">Ye Fitoor Mera (Official Song) | Fitoor | Arijit Singh | Amit Trivedi</h3>
+                    <div class="channel-name" id="channel-name-1">Zee Music Company</div>
+                    <div class="video-meta">85M views • 8 years ago</div>
+                    <p style="font-size: 12px; color: #aaa; margin-top: 4px;">Official music video of 'Ye Fitoor Mera' composed by Amit Trivedi and sung by Arijit Singh.</p>
+                </div>
+            </div>
+
+            <div class="video-card" id="video-card-2" role="button" aria-label="Play Ye Fitoor Mera Lyrical Video" onclick="playVideo('Ye Fitoor Mera - Lyrical Video | Fitoor', 'Zee Music Classics')">
+                <div class="thumbnail">▶</div>
+                <div class="video-info">
+                    <h3 class="video-title" id="video-title-2">Ye Fitoor Mera - Lyrical Video | Fitoor</h3>
+                    <div class="channel-name" id="channel-name-2">Zee Music Classics</div>
+                    <div class="video-meta">22M views • 7 years ago</div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <script>
+        function performSearch() {
+            const query = document.getElementById('search').value.trim();
+            document.getElementById('results-query').innerText = query;
+            document.getElementById('results-heading').style.display = 'block';
+            document.getElementById('search-results').style.display = 'flex';
+            if (query) {
+                document.title = query + ' - Mock YouTube Search Results';
+                window.location.hash = 'results?search_query=' + encodeURIComponent(query);
+            }
+        }
+
+        document.getElementById('search').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                performSearch();
+            }
+        });
+
+        function playVideo(title, channel) {
+            document.getElementById('player-container').style.display = 'block';
+            document.getElementById('video-title-display').innerText = title;
+            const badge = document.getElementById('playback-status');
+            badge.innerText = 'PLAYING';
+            badge.style.background = '#22c55e';
+            badge.className = 'playback-badge playing';
+            document.getElementById('play-pause-btn').innerText = 'Pause';
+            document.getElementById('movie_player').setAttribute('data-playing', 'true');
+            document.title = title + ' - Mock YouTube';
+            window.location.hash = 'watch?v=yefitoormera';
+
+            const vid = document.getElementById('video-element');
+            if (vid) {
+                vid.style.display = 'block';
+                Object.defineProperty(vid, 'paused', { value: false, configurable: true });
+                Object.defineProperty(vid, 'currentTime', { value: 3.5, configurable: true });
+                Object.defineProperty(vid, 'duration', { value: 272.0, configurable: true });
+                Object.defineProperty(vid, 'readyState', { value: 4, configurable: true });
+                Object.defineProperty(vid, 'ended', { value: false, configurable: true });
+            }
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+        }
+
+        function togglePlay() {
+            const badge = document.getElementById('playback-status');
+            const btn = document.getElementById('play-pause-btn');
+            const vid = document.getElementById('video-element');
+            if (badge.innerText === 'PLAYING') {
+                badge.innerText = 'PAUSED';
+                badge.style.background = '#eab308';
+                badge.className = 'playback-badge paused';
+                btn.innerText = 'Play';
+                document.getElementById('movie_player').setAttribute('data-playing', 'false');
+                if (vid) {
+                    Object.defineProperty(vid, 'paused', { value: true, configurable: true });
+                }
+            } else {
+                badge.innerText = 'PLAYING';
+                badge.style.background = '#22c55e';
+                badge.className = 'playback-badge playing';
+                btn.innerText = 'Pause';
+                document.getElementById('movie_player').setAttribute('data-playing', 'true');
+                if (vid) {
+                    Object.defineProperty(vid, 'paused', { value: false, configurable: true });
+                    Object.defineProperty(vid, 'currentTime', { value: 3.5, configurable: true });
+                    Object.defineProperty(vid, 'readyState', { value: 4, configurable: true });
+                }
+            }
+        }
+    </script>
+</body>
+</html>

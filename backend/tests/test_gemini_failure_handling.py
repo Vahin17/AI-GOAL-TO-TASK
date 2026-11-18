@@ -122,7 +122,7 @@ async def test_2_permanent_429_causes_zero_browser_agent_retry_iterations():
     # CRITICAL: Exactly 1 Gemini call was made, zero retry iterations
     assert gemini_call_count == 1
     assert result.outcome == BrowserAgentOutcome.FAILED
-    assert "Unrecoverable LLM failure" in result.error
+    assert "LLM provider quota exhausted" in result.error or "Unrecoverable LLM failure" in result.error
     assert len(result.actions_taken) == 0
 
 
@@ -278,26 +278,33 @@ async def test_5_successful_gemini_path_unchanged():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6. Non-Browser Tasks Not Accidentally Affected
+# 6. Non-Browser Tasks Execute via Tool Contracts & Reject Simulation
 # ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_6_non_browser_tasks_not_affected():
-    """Non-browser tasks execute through tool registry or simulation normally."""
+    """Non-browser tasks execute through tool registry contracts, while unbound tasks fail closed."""
     from orchestration.runtime_engine import RuntimeEngine
+    from execution.registry.tool_models import ToolCall
 
     graph = ARDOGraph()
     node = ARDOTaskNode(
         task_id="task_generic_1",
         task_name="Process Data Computation",
         status=TaskState.ACTIVE,
+        tool_call=ToolCall(
+            call_id="call_c1",
+            tool_name="calculator",
+            action_name="evaluate",
+            arguments={"expression": "10 * 10"},
+        ),
     )
     graph.nodes["task_generic_1"] = node
 
     engine = RuntimeEngine(session_id="s_test", graph=graph)
-
-    with patch("random.random", return_value=0.99):  # Will not trigger SIM_FAILURE_RATE (0.15)
-        success = await engine._attempt_execution(node)
+    success = await engine._attempt_execution(node)
 
     assert success is True
     assert node.status == TaskState.COMPLETED
+    assert node.tool_result is not None
+    assert node.tool_result.output_data.get("result") == 100

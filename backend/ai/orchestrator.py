@@ -1,6 +1,7 @@
+import asyncio
 import logging
 import uuid
-from typing import Optional
+from typing import Optional, Tuple
 from datetime import datetime
 from schemas.models import PlanGraphResponse
 from core.config import settings
@@ -8,11 +9,70 @@ from ai.fallback_rules import generate_fallback_plan
 from core.database import get_database
 from orchestration.safety_engine import SafetyEngine
 from knowledge.rag_service import RAGService
-from ai.input_guard import InputGuard, InputGuardVerdict
-from ai.plan_critic import PlanCritic
+from ai.input_guard import (
+    InputGuard,
+    InputGuardVerdict,
+    InputDeniedError,
+    InputReviewRequiredError,
+)
+from ai.plan_critic import PlanCritic, CriticIssueSeverity
 from orchestration.plan_hasher import compute_plan_hash
 
 logger = logging.getLogger(__name__)
+
+
+def _classify_planning_exception(exc: Exception) -> Tuple[str, str]:
+    """Classifies primary AI planning exceptions into a structured failure code and safe explanation."""
+    cls_name = type(exc).__name__.lower()
+    msg_lower = str(exc).lower()
+
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)) or "timed out" in msg_lower or "timeout" in msg_lower:
+        return (
+            "provider_timeout",
+            "Primary AI planning provider timed out; deterministic fallback planner engaged.",
+        )
+    if "quota" in cls_name or "quota" in msg_lower:
+        return (
+            "provider_quota_exhausted",
+            "Primary AI planning provider quota exhausted; deterministic fallback planner engaged.",
+        )
+    if "ratelimit" in cls_name or "rate limit" in msg_lower or "429" in msg_lower:
+        return (
+            "provider_rate_limited",
+            "Primary AI planning provider rate-limited; deterministic fallback planner engaged.",
+        )
+    if "auth" in cls_name or "api_key" in msg_lower or "api key" in msg_lower or "authentication" in msg_lower or "401" in msg_lower or "403" in msg_lower:
+        return (
+            "provider_auth_error",
+            "Primary AI planning provider credentials unconfigured or invalid; deterministic fallback planner engaged.",
+        )
+    if "unavailable" in cls_name or "503" in msg_lower or "service unavailable" in msg_lower:
+        return (
+            "provider_unavailable",
+            "Primary AI planning provider service unavailable; deterministic fallback planner engaged.",
+        )
+    if "no candidates" in msg_lower or "no text parts" in msg_lower or "empty response" in msg_lower or "empty output" in msg_lower:
+        return (
+            "empty_response",
+            "Primary AI planning provider returned an empty response; deterministic fallback planner engaged.",
+        )
+    if (
+        "outputparser" in cls_name
+        or "validationerror" in cls_name
+        or "jsondecode" in cls_name
+        or "failed to parse" in msg_lower
+        or "validation error" in msg_lower
+        or "malformed" in msg_lower
+        or "invalid json" in msg_lower
+    ):
+        return (
+            "malformed_output",
+            "Primary AI planning provider returned malformed structured output; deterministic fallback planner engaged.",
+        )
+    return (
+        "provider_error",
+        "Generative provider unavailable or unreached; rule-based fallback engaged.",
+    )
 
 # Lazy-load the provider based on configuration settings
 def get_llm_provider():
@@ -43,10 +103,10 @@ async def generate_task_graph(goal_text: str, user_id: Optional[str] = None) -> 
     guard_result = InputGuard.validate_goal(goal_text)
     if guard_result.verdict == InputGuardVerdict.DENY:
         logger.warning(f"[InputGuard] Blocked goal '{goal_text[:50]}': {guard_result.reason}")
-        raise ValueError(f"Input rejected by safety guard: {guard_result.reason}")
+        raise InputDeniedError(f"Input rejected by safety guard: {guard_result.reason}", guard_result=guard_result)
     if guard_result.verdict == InputGuardVerdict.REVIEW:
         logger.warning(f"[InputGuard] Review required for goal '{goal_text[:50]}': {guard_result.reason}")
-        raise ValueError(f"Review required: {guard_result.reason}")
+        raise InputReviewRequiredError(f"Review required: {guard_result.reason}", guard_result=guard_result)
 
     sanitized_goal = guard_result.sanitized_goal
 
@@ -98,11 +158,26 @@ async def generate_task_graph(goal_text: str, user_id: Optional[str] = None) -> 
                 rag_context=rag_context,
                 critic_feedback=critic_feedback,
             )
+            if plan_response is None:
+                raise ValueError("Empty response: primary AI planner returned None.")
             logger.info(f"[LLM-PLAN] provider={settings.LLM_PROVIDER} model={settings.MODEL_NAME} inference=SUCCESS attempt={attempt} nodes={len(plan_response.nodes)}")
         except Exception as e:
-            logger.error(f"Error during generative AI planning (attempt {attempt}): {e}. Executing fallback sequence.")
-            logger.info(f"[LLM-PLAN] provider={settings.LLM_PROVIDER} model={settings.MODEL_NAME} inference=FALLBACK_ENGAGED")
-            plan_response = await generate_fallback_plan(sanitized_goal)
+            failure_code, safe_reason = _classify_planning_exception(e)
+            logger.error(f"Error during generative AI planning (attempt {attempt}, code={failure_code}): {e}. Executing fallback sequence.")
+            logger.info(f"[LLM-PLAN] provider={settings.LLM_PROVIDER} model={settings.MODEL_NAME} inference=FALLBACK_ENGAGED reason_code={failure_code}")
+            plan_response = await generate_fallback_plan(
+                sanitized_goal,
+                is_fallback=True,
+                fallback_reason=safe_reason,
+                primary_failure_code=failure_code,
+            )
+            fb_critic = PlanCritic.evaluate_grounding_and_relevance(
+                goal=sanitized_goal,
+                nodes=plan_response.nodes,
+                edges=plan_response.edges,
+                rag_context=rag_context,
+            )
+            plan_response.critic_result = fb_critic.model_dump()
             break
 
         # Independent Plan Critic Pass
@@ -120,7 +195,16 @@ async def generate_task_graph(goal_text: str, user_id: Optional[str] = None) -> 
                     f"[PlanCritic] Critic issues remaining after attempt {attempt}: {critic_result.summary}. "
                     f"Rejecting invalid plan and falling back to safe deterministic plan."
                 )
-                plan_response = await generate_fallback_plan(sanitized_goal)
+                reject_reason = (
+                    f"Primary AI plan rejected by validation critic ({critic_result.summary}); "
+                    f"deterministic fallback planner engaged."
+                )
+                plan_response = await generate_fallback_plan(
+                    sanitized_goal,
+                    is_fallback=True,
+                    fallback_reason=reject_reason,
+                    primary_failure_code="validation_rejected",
+                )
                 fb_critic = PlanCritic.evaluate_grounding_and_relevance(
                     goal=sanitized_goal,
                     nodes=plan_response.nodes,
@@ -130,13 +214,24 @@ async def generate_task_graph(goal_text: str, user_id: Optional[str] = None) -> 
                 plan_response.critic_result = fb_critic.model_dump()
             else:
                 logger.info(f"[PlanCritic] Verification passed: {critic_result.summary}")
+                plan_response.metadata.is_fallback = False
+                plan_response.metadata.fallback_reason = None
+                plan_response.metadata.planning_mode = "primary_ai"
+                plan_response.metadata.provider_used = f"{settings.LLM_PROVIDER}:{settings.MODEL_NAME}"
+                plan_response.metadata.primary_failure_code = None
+                plan_response.metadata.validation_passed = True
             break
         else:
             logger.warning(f"[PlanCritic] Plan rejected on attempt {attempt}: {critic_result.summary}. Retrying with feedback.")
             critic_feedback = critic_result.regeneration_prompt_feedback
 
     if plan_response is None:
-        plan_response = await generate_fallback_plan(sanitized_goal)
+        plan_response = await generate_fallback_plan(
+            sanitized_goal,
+            is_fallback=True,
+            fallback_reason="Primary AI planner produced no response; deterministic fallback planner engaged.",
+            primary_failure_code="empty_response",
+        )
         fb_critic = PlanCritic.evaluate_grounding_and_relevance(
             goal=sanitized_goal,
             nodes=plan_response.nodes,
@@ -144,6 +239,18 @@ async def generate_task_graph(goal_text: str, user_id: Optional[str] = None) -> 
             rag_context=rag_context,
         )
         plan_response.critic_result = fb_critic.model_dump()
+
+    # Final structural & capability gate: never allow a structurally invalid plan (even fallback) to proceed
+    final_structural_issues = PlanCritic.validate_dag_structure(plan_response.nodes, plan_response.edges)
+    final_cap_issues = PlanCritic.validate_tool_capabilities(plan_response.nodes)
+    critical_structural = [
+        iss for iss in (final_structural_issues + final_cap_issues)
+        if iss.severity == CriticIssueSeverity.CRITICAL
+    ]
+    if not plan_response.nodes or critical_structural:
+        err_summary = "; ".join(i.message for i in critical_structural) or "Plan contains zero task nodes."
+        plan_response.metadata.validation_passed = False
+        raise ValueError(f"Plan rejected by structural validation gate: {err_summary}")
 
     # Attach RAG provenance to response
     if provenance:

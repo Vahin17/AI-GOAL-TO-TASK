@@ -244,15 +244,18 @@ class RuntimeEngine:
         if getattr(node, "tool_name", None) == "browser":
             return True
         meta = getattr(node, "metadata", {}) or {}
-        if meta.get("tool") == "browser" or meta.get("is_browser_task"):
+        if meta.get("tool") == "browser" or meta.get("is_browser_task") is True:
             return True
+        if "is_browser_task" in meta and meta.get("is_browser_task") is False:
+            return False
 
         label_lower = node.task_name.lower()
-        if any(verb in label_lower for verb in (
-            "navigate", "visit", "browse", "click", "fill", "extract",
-            "screenshot", "scroll", "page", "tab", "search", "http://", "https://",
-            "open", "wikipedia", "youtube", "google", "website", "update", "edit"
-        )):
+        if "http://" in label_lower or "https://" in label_lower or "file://" in label_lower:
+            return True
+        if re.search(
+            r'\b(?:navigate|visit|browse|click|fill|extract|screenshot|scroll|page|tab|search|open|wikipedia|youtube|google|website|update|edit|play|song|video|audio|music|playback)\b',
+            label_lower,
+        ):
             return True
         if re.search(r'\b(?:open|load|close|switch to)\s+(?:a\s+)?(?:new\s+)?(?:tab|page|browser|website|url|site)\b', label_lower):
             return True
@@ -533,6 +536,58 @@ class RuntimeEngine:
 
     # ── Task Execution ─────────────────────────────────────────────────────
 
+    def _verify_plan_approval_for_task(
+        self, task_id: str, node: ARDOTaskNode
+    ) -> Tuple[bool, Optional[str], Optional[str]]:
+        """
+        Cryptographic verification of plan approval binding for a gated task.
+        Enforced identically across sequential, safe, and parallel execution modes.
+        Returns (is_approved, failure_reason, current_plan_hash).
+        """
+        clean_session_id = str(self.session_id or "").strip()
+        clean_user_id = str(self.user_id or getattr(self.graph, "user_id", None) or "").strip()
+
+        if not clean_session_id or not clean_user_id:
+            reason = "Cryptographic approval verification failed: missing mandatory session or user identity."
+            logger.error(f"[RuntimeEngine] {reason} (session={self.session_id}, task={task_id})")
+            return False, reason, None
+
+        current_plan_hash = None
+        if hasattr(self.graph, "recompute_plan_hash"):
+            try:
+                current_plan_hash = self.graph.recompute_plan_hash(
+                    goal_text=self.goal_id,
+                    session_id=clean_session_id,
+                    user_id=clean_user_id,
+                )
+            except Exception as e:
+                logger.error(f"[RuntimeEngine] Authoritative plan hash recomputation failed: {e}")
+                current_plan_hash = None
+
+        if not current_plan_hash or not str(current_plan_hash).strip():
+            reason = "Cryptographic approval verification failed: authoritative plan hash recomputation failed."
+            logger.error(f"[RuntimeEngine] {reason} (session={self.session_id}, task={task_id})")
+            return False, reason, None
+
+        from core.auth_db import AuthDatabase
+        try:
+            auth_db = AuthDatabase.get_instance()
+            is_approved = auth_db.is_plan_approved(
+                session_id=clean_session_id,
+                plan_hash=current_plan_hash,
+                task_id=task_id,
+            )
+        except Exception as e:
+            logger.warning(f"[RuntimeEngine] Error checking plan approval DB: {e}")
+            is_approved = False
+
+        if not is_approved:
+            reason = "Cryptographic approval verification failed: plan modified, unapproved, or approval expired."
+            logger.error(f"[RuntimeEngine] {reason} (session={self.session_id}, task={task_id})")
+            return False, reason, current_plan_hash
+
+        return True, None, current_plan_hash
+
     async def _execute_task(
         self, task_id: str
     ) -> AsyncGenerator[OrchestrationEvent, None]:
@@ -557,65 +612,9 @@ class RuntimeEngine:
         # ── Phase 2: Cryptographic Plan Approval Binding Verification ──
         was_gated = getattr(node, "was_approval_gated", False) or "Operator approved." in "".join(node.execution_logs)
         if was_gated:
-            clean_session_id = str(self.session_id or "").strip()
-            clean_user_id = str(self.user_id or getattr(self.graph, "user_id", None) or "").strip()
-
-            if not clean_session_id or not clean_user_id:
-                reason = "Cryptographic approval verification failed: missing mandatory session or user identity."
-                logger.error(f"[RuntimeEngine] {reason} (session={self.session_id}, task={task_id})")
-                self._quarantine_branch(task_id, reason)
-                yield OrchestrationEvent(
-                    event_type="task_approval_invalidated",
-                    session_id=self.session_id,
-                    task_id=task_id,
-                    task_name=node.task_name,
-                    status="failed",
-                    details={"reason": reason},
-                )
-                return
-
-            current_plan_hash = None
-            if hasattr(self.graph, "recompute_plan_hash"):
-                try:
-                    current_plan_hash = self.graph.recompute_plan_hash(
-                        goal_text=self.goal_id,
-                        session_id=clean_session_id,
-                        user_id=clean_user_id,
-                    )
-                except Exception as e:
-                    logger.error(f"[RuntimeEngine] Authoritative plan hash recomputation failed: {e}")
-                    current_plan_hash = None
-
-            if not current_plan_hash or not str(current_plan_hash).strip():
-                reason = "Cryptographic approval verification failed: authoritative plan hash recomputation failed."
-                logger.error(f"[RuntimeEngine] {reason} (session={self.session_id}, task={task_id})")
-                self._quarantine_branch(task_id, reason)
-                yield OrchestrationEvent(
-                    event_type="task_approval_invalidated",
-                    session_id=self.session_id,
-                    task_id=task_id,
-                    task_name=node.task_name,
-                    status="failed",
-                    details={"reason": reason},
-                )
-                return
-
-            from core.auth_db import AuthDatabase
-            try:
-                auth_db = AuthDatabase.get_instance()
-                is_approved = auth_db.is_plan_approved(
-                    session_id=clean_session_id,
-                    plan_hash=current_plan_hash,
-                    task_id=task_id,
-                )
-            except Exception as e:
-                logger.warning(f"[RuntimeEngine] Error checking plan approval DB: {e}")
-                is_approved = False
-
-            if not is_approved:
-                reason = "Cryptographic approval verification failed: plan modified, unapproved, or approval expired."
-                logger.error(f"[RuntimeEngine] {reason} (session={self.session_id}, task={task_id})")
-                self._quarantine_branch(task_id, reason)
+            is_valid, reason, current_plan_hash = self._verify_plan_approval_for_task(task_id, node)
+            if not is_valid:
+                self._quarantine_branch(task_id, reason or "Cryptographic approval verification failed.")
                 yield OrchestrationEvent(
                     event_type="task_approval_invalidated",
                     session_id=self.session_id,
@@ -661,12 +660,8 @@ class RuntimeEngine:
                 },
             )
 
-        # ── Execution delay (only for generic simulation tasks) ──────────
-        is_tool_candidate = self._is_browser_task(node) or getattr(node, "tool_call", None) is not None
-        if not is_tool_candidate:
-            exec_time = random.uniform(SIM_EXEC_TIME_MIN, SIM_EXEC_TIME_MAX)
-            node.estimated_execution_time = exec_time
-            await asyncio.sleep(exec_time)
+        # ── Execution delay check ───────────────────────────────────────
+        # Simulated artificial delay eliminated under fail-closed invariant.
 
         # ── Determine outcome with bounded execution timeout (Phase 4) ──
         timeout_seconds = getattr(settings, "TASK_EXECUTION_TIMEOUT_SECONDS", 120.0)
@@ -760,8 +755,9 @@ class RuntimeEngine:
                     # Record uncertain evidence in EvidenceVault
                     try:
                         from execution.evidence.evidence_vault import EvidenceVault
+                        ev_owner = str(self.user_id or getattr(self.graph, "user_id", None) or "").strip()
                         EvidenceVault.record_evidence(
-                            user_id=self.user_id or "system",
+                            user_id=ev_owner if ev_owner else None,
                             session_id=self.session_id,
                             plan_id=self.goal_id or self.session_id,
                             plan_hash=getattr(self.graph, "plan_hash", "") or "unhashed",
@@ -845,7 +841,19 @@ class RuntimeEngine:
                     task_id, reschedule_event.reason, self._execution_queue
                 )
 
-            yield self.monitor.on_task_completed(task_id, node.task_name)
+            is_ver = bool(
+                (node.metadata.get("verification_status") if isinstance(node.metadata, dict) else None) == "verified"
+                or node.status == TaskState.VERIFIED
+            )
+            v_stat = (node.metadata.get("verification_status") if isinstance(node.metadata, dict) else None) or ("verified" if is_ver else "unverified")
+            art_h = node.metadata.get("artifact_hash") if isinstance(node.metadata, dict) else None
+            yield self.monitor.on_task_completed(
+                task_id,
+                node.task_name,
+                is_verified=is_ver,
+                verification_status=v_stat,
+                artifact_hash=art_h,
+            )
 
             # Record outcome for weight optimizer
             self._record_outcome(node, "success")
@@ -892,7 +900,19 @@ class RuntimeEngine:
 
                 try:
                     agent = self._get_browser_agent()
-                    node_meta = getattr(node, "metadata", {}) or {}
+                    node_meta = dict(getattr(node, "metadata", {}) or {})
+                    b_act = getattr(node, "browser_action", None)
+                    if b_act is not None:
+                        act_url = b_act.get("url") if isinstance(b_act, dict) else getattr(b_act, "url", None)
+                        act_type = b_act.get("action_type") if isinstance(b_act, dict) else getattr(b_act, "action_type", None)
+                        if hasattr(act_type, "value"):
+                            act_type = act_type.value
+                        if act_url and "url" not in node_meta:
+                            node_meta["url"] = act_url
+                        if act_url and "expected_url" not in node_meta:
+                            node_meta["expected_url"] = act_url
+                        if act_type and "action_type" not in node_meta:
+                            node_meta["action_type"] = str(act_type)
 
                     # Inspect predecessor tasks in the DAG for verified postcondition state
                     precondition_url = None
@@ -930,6 +950,7 @@ class RuntimeEngine:
                         objective=node.task_name,
                         session_id=self.session_id,
                         goal_text=self.goal_id or node.task_name,
+                        expected_url=node_meta.get("expected_url") or node_meta.get("destination_url") or node_meta.get("url"),
                         success_criteria=node_meta.get("success_criteria"),
                         constraints=node_meta.get("constraints", []),
                         metadata=node_meta,
@@ -1021,6 +1042,12 @@ class RuntimeEngine:
             # 2. Non-browser Tool Execution via session-scoped ToolRegistry
             elif getattr(node, "tool_call", None) is not None:
                 from orchestration.safety_schemas import ExecutionDecision
+                if isinstance(node.tool_call, dict):
+                    from execution.registry.tool_models import ToolCall
+                    tc_kwargs = dict(node.tool_call)
+                    tc_kwargs.setdefault("call_id", f"call_{node.task_id}")
+                    tc_kwargs.setdefault("action_name", tc_kwargs.get("action_type", "execute"))
+                    node.tool_call = ToolCall(**tc_kwargs)
                 registry = self.tool_registry if hasattr(self, "tool_registry") else None
                 if registry is None:
                     from execution.registry.tool_registry import ToolRegistry
@@ -1067,9 +1094,22 @@ class RuntimeEngine:
                 )
                 failed = not tool_result.success
 
-            # 3. Simulated Generic Tasks
+            # 3. Unbound Tasks Without Suitable Registered Executor — FAIL CLOSED
             else:
-                failed = random.random() < SIM_FAILURE_RATE
+                logger.error(
+                    f"[RuntimeEngine] Task {node.task_id} ('{node.task_name}') has no executable "
+                    f"tool binding or browser action. Simulated completion forbidden. Failing closed."
+                )
+                node.execution_logs.append(
+                    "No executable binding or tool executor. Simulated completion forbidden."
+                )
+                node.status = TaskStateMachine.transition(
+                    node.status if node.status in (TaskState.ACTIVE, TaskState.RETRYING)
+                    else TaskState.ACTIVE,
+                    TaskState.FAILED,
+                    node.task_id,
+                )
+                return False
 
             if not failed:
                 self.retry_manager.record_success(node)
@@ -1098,8 +1138,6 @@ class RuntimeEngine:
                 node.status = TaskStateMachine.transition(
                     TaskState.RETRYING, TaskState.ACTIVE, node.task_id
                 )
-                if getattr(node, "tool_call", None) is None and getattr(node, "browser_action", None) is None:
-                    await asyncio.sleep(random.uniform(SIM_EXEC_TIME_MIN, SIM_EXEC_TIME_MAX))
             else:
                 node.status = TaskStateMachine.transition(
                     TaskState.ACTIVE, TaskState.FAILED, node.task_id
@@ -1118,9 +1156,9 @@ class RuntimeEngine:
             from execution.evidence.evidence_vault import EvidenceVault
             plan_hash = getattr(self.graph, "plan_hash", "") or "unhashed"
             browser_res = getattr(node, "browser_result", None)
-            v_status = "verified"
+            v_status = "unverified"
             v_reason = None
-            conf = 0.95
+            conf = 0.0
             ev_type = "task_execution"
             raw_payload = None
 
@@ -1128,20 +1166,46 @@ class RuntimeEngine:
                 verif = browser_res.verification
                 v_status = verif.status.value if hasattr(verif.status, "value") else str(verif.status)
                 v_reason = verif.failure_reason
-                conf = getattr(verif, "confidence_score", 0.95)
+                v_by = getattr(verif, "verified_by", None)
+                conf = getattr(verif, "confidence_score", 0.0)
                 ev_type = "browser_verification"
-                raw_payload = f"URL: {verif.observed_url} | Title: {verif.observed_title} | Reason: {v_reason}"
+                raw_payload = (
+                    f"Task: {node.task_id} ({node.task_name}) | "
+                    f"URL: {verif.observed_url} | Title: {verif.observed_title} | "
+                    f"VerifiedBy: {v_by} | Reason: {v_reason}"
+                )
             elif getattr(node, "tool_result", None) is not None:
                 tr = node.tool_result
                 ev_type = "tool_execution"
-                v_status = "verified" if tr.success else "failed"
-                conf = 1.0 if tr.success else 0.0
-                raw_payload = str(tr.data) if hasattr(tr, "data") else str(tr)
+                out_data = getattr(tr, "output_data", None)
+                if out_data is None and hasattr(tr, "data"):
+                    out_data = getattr(tr, "data", None)
+                has_valid_output = bool(
+                    (isinstance(out_data, dict) and len(out_data) > 0)
+                    or (out_data is not None and not isinstance(out_data, dict) and str(out_data).strip() != "")
+                    or bool(getattr(tr, "extracted_text", None))
+                    or bool(getattr(tr, "artifacts", None))
+                )
+                is_tool_verified = bool(getattr(tr, "success", False) is True and has_valid_output)
+                v_status = "verified" if is_tool_verified else ("unverified" if getattr(tr, "success", False) else "failed")
+                conf = 1.0 if is_tool_verified else 0.0
+                if isinstance(out_data, (dict, list)) and len(out_data) > 0:
+                    import json
+                    raw_payload = json.dumps(out_data, sort_keys=True)
+                elif out_data is not None and not isinstance(out_data, (dict, list)) and str(out_data).strip() != "":
+                    raw_payload = str(out_data)
+                elif getattr(tr, "extracted_text", None):
+                    raw_payload = str(tr.extracted_text)
+                else:
+                    raw_payload = None
             else:
-                raw_payload = f"Task {node.task_id} ({node.task_name}) completed successfully"
+                v_status = "unverified"
+                conf = 0.0
+                raw_payload = f"Task {node.task_id} ({node.task_name}) completed without empirical verification artifact"
 
+            ev_owner = str(self.user_id or getattr(self.graph, "user_id", None) or "").strip()
             rec = EvidenceVault.record_evidence(
-                user_id=self.user_id or "system",
+                user_id=ev_owner if ev_owner else None,
                 session_id=self.session_id,
                 plan_id=self.goal_id or self.session_id,
                 plan_hash=plan_hash,
@@ -1167,6 +1231,9 @@ class RuntimeEngine:
     async def _handle_failure(self, node: ARDOTaskNode, reason: str = "Task execution failed") -> None:
         """Post-failure bookkeeping & cryptographic evidence recording."""
         node.execution_logs.append(f"Failed: {reason}")
+        if node.metadata is None:
+            node.metadata = {}
+        node.metadata["failure_reason"] = reason
         try:
             from execution.evidence.evidence_vault import EvidenceVault
             plan_hash = getattr(self.graph, "plan_hash", "") or "unhashed"
@@ -1183,8 +1250,9 @@ class RuntimeEngine:
                 ev_type = "browser_verification"
                 raw_payload = f"URL: {verif.observed_url} | Title: {verif.observed_title} | Error: {v_reason}"
 
+            ev_owner = str(self.user_id or getattr(self.graph, "user_id", None) or "").strip()
             rec = EvidenceVault.record_evidence(
-                user_id=self.user_id or "system",
+                user_id=ev_owner if ev_owner else None,
                 session_id=self.session_id,
                 plan_id=self.goal_id or self.session_id,
                 plan_hash=plan_hash,
@@ -1222,16 +1290,45 @@ class RuntimeEngine:
         node = self.graph.get_node(task_id)
         if not node:
             return
-        if node.status in (TaskState.COMPLETED, TaskState.FAILED, TaskState.BLOCKED):
+        if node.status in (TaskState.COMPLETED, TaskState.FAILED, TaskState.BLOCKED, TaskState.APPROVAL_NEEDED):
             return
         if task_id in self._dispatched:
             return
         self._dispatched.add(task_id)
+
+        # ── Cryptographic Plan Approval Binding Verification (Parallel Mode) ──
+        was_gated = getattr(node, "was_approval_gated", False) or "Operator approved." in "".join(node.execution_logs)
+        if was_gated:
+            is_valid, reason, current_plan_hash = self._verify_plan_approval_for_task(task_id, node)
+            if not is_valid:
+                node.metadata["quarantine_reason"] = reason
+                self._quarantine_branch(task_id, reason or "Cryptographic approval verification failed.")
+                if not hasattr(self, "_pending_events") or self._pending_events is None:
+                    self._pending_events = []
+                self._pending_events.append(
+                    OrchestrationEvent(
+                        event_type="task_approval_invalidated",
+                        session_id=self.session_id,
+                        task_id=task_id,
+                        task_name=node.task_name,
+                        status="failed",
+                        details={"reason": reason, "plan_hash": current_plan_hash},
+                    )
+                )
+                self._dispatched.discard(task_id)
+                return
+
         try:
             node.status = TaskStateMachine.transition(node.status, TaskState.ACTIVE, task_id)
             node.started_at = time.time()
             success = await self._attempt_execution(node)
             if success:
+                node.status = TaskStateMachine.transition(
+                    node.status,
+                    TaskState.COMPLETED,
+                    node.task_id,
+                )
+                node.completed_at = time.time()
                 await self._handle_success(node)
                 self._execution_queue = self.rescheduler.on_task_completed(task_id, self.graph)
                 self._record_outcome(node, "success")
@@ -1389,29 +1486,54 @@ class RuntimeEngine:
         except Exception as e:
             logger.debug(f"[RuntimeEngine] Checkpoint save note: {e}")
 
+    def _is_fallback_graph(self) -> bool:
+        """Determines whether the active orchestration graph originated from heuristic fallback planning."""
+        if not self.graph:
+            return False
+        if hasattr(self.graph, "is_fallback_plan") and callable(self.graph.is_fallback_plan):
+            if self.graph.is_fallback_plan():
+                return True
+        if getattr(self.graph, "is_fallback", False):
+            return True
+        g_meta = getattr(self.graph, "metadata", None)
+        if isinstance(g_meta, dict) and g_meta.get("is_fallback"):
+            return True
+        if getattr(g_meta, "is_fallback", False):
+            return True
+        return any(
+            isinstance(getattr(n, "metadata", None), dict) and bool(n.metadata.get("is_fallback"))
+            for n in getattr(self.graph, "nodes", {}).values()
+        )
+
     def _persist_semantic_memory(self) -> None:
         """Phase 8 & Phase 3: Evaluates goal outcome verification, stores semantic memory, and generates candidate playbooks."""
+        is_fallback_graph = self._is_fallback_graph()
         try:
             from execution.evidence.evidence_vault import EvidenceVault
             from execution.browser.semantic_verifier import SemanticVerifier
             from knowledge.playbook_service import PlaybookService
 
-            evidence_items = EvidenceVault.get_session_evidence(
-                session_id=self.session_id, user_id=self.user_id or "system"
+            clean_uid = str(self.user_id or getattr(self.graph, "user_id", None) or "").strip()
+            evidence_items = (
+                EvidenceVault.get_session_evidence(session_id=self.session_id, user_id=clean_uid)
+                if clean_uid
+                else []
             )
             goal_res = SemanticVerifier.verify_goal_outcome(
                 goal_text=self.goal_id or self.session_id,
                 graph=self.graph,
                 session_id=self.session_id,
                 evidence_items=evidence_items,
+                user_id=clean_uid if clean_uid else None,
             )
             self._goal_verification = goal_res
 
-            # Phase 3: Invariant - Only VERIFIED goals produce candidate playbooks
-            if goal_res.overall_status == "verified":
+            # Phase 3: Invariant - Only VERIFIED non-fallback goals with empirical evidence produce candidate playbooks
+            # AUD-S3-03: Candidate playbook synthesis requires explicit authenticated user_id; no "system" fallback
+            if clean_uid and goal_res.overall_status == "verified" and not is_fallback_graph and evidence_items and len(evidence_items) > 0:
                 try:
                     candidate_pb = PlaybookService.generate_candidate_playbook(
-                        user_id=self.user_id or "system",
+                        user_id=clean_uid,
                         session_id=self.session_id,
                         goal_text=self.goal_id or self.session_id,
                         graph=self.graph,
@@ -1496,7 +1618,10 @@ class RuntimeEngine:
                 outcome_status = "blocked"
             elif completed_count < len(tasks):
                 outcome_status = "incomplete"
-            elif goal_verif_status and goal_verif_status != "verified":
+            elif not goal_verif or goal_verif_status != "verified":
+                outcome_status = "unverified"
+            elif is_fallback_graph:
+                # Heuristic fallback plans are not considered proven successful plans for memory promotion
                 outcome_status = "unverified"
             else:
                 outcome_status = "success"
@@ -1512,6 +1637,20 @@ class RuntimeEngine:
                 "success_rate": (completed_count / len(tasks) * 100.0) if tasks else 0.0,
             }
 
+            # AUD-S3-02: Forward strictly verified supporting evidence hashes to record_plan_outcome
+            supporting_hashes: List[str] = []
+            if goal_verif and getattr(goal_verif, "overall_status", "") == "verified":
+                for h in (getattr(goal_verif, "supporting_evidence_hashes", []) or []):
+                    clean_h = str(h).strip()
+                    if len(clean_h) == 64 and all(c in "0123456789abcdefABCDEF" for c in clean_h):
+                        if clean_h not in supporting_hashes:
+                            supporting_hashes.append(clean_h)
+            meta_payload = {
+                "evidence_hashes": supporting_hashes,
+                "verification_status": goal_verif_status,
+                "is_fallback": is_fallback_graph,
+            }
+
             rag.record_plan_outcome(
                 goal_text=self.goal_id or self.session_id,
                 plan_id=self.goal_id or self.session_id,
@@ -1520,7 +1659,8 @@ class RuntimeEngine:
                 task_summary=summary_str,
                 execution_metrics=metrics,
                 safety_summary={"blocked_count": blocked_count},
-                user_id=self.user_id,
+                metadata=meta_payload,
+                user_id=clean_uid if clean_uid else None,
             )
             logger.info(f"[RuntimeEngine] Recorded session {self.session_id} outcome ({outcome_status}) to Semantic Memory.")
         except Exception as e:
@@ -1545,6 +1685,9 @@ class RuntimeEngine:
             f"[RuntimeEngine] Pausing session {self.session_id} (reason: {reason}, "
             f"cooldown: {cooldown_seconds:.1f}s)..."
         )
+        evt = self.monitor.on_task_paused(reason=reason)
+        if hasattr(self, "_pending_events"):
+            self._pending_events.append(evt)
         try:
             from orchestration.checkpoint_manager import ExecutionCheckpointManager
             await ExecutionCheckpointManager.save_checkpoint(
@@ -1557,6 +1700,32 @@ class RuntimeEngine:
             )
         except Exception as e:
             logger.warning(f"[RuntimeEngine] Checkpoint save during pause note: {e}")
+
+    async def cancel(self, reason: str = "manual") -> None:
+        """
+        Safely cancels execution, transitions active/pending nodes to CANCELLED,
+        and marks loop stopped.
+        """
+        self._is_cancelled = True
+        self._cancel_reason = reason
+        logger.info(f"[RuntimeEngine] Cancelling session {self.session_id} (reason: {reason})...")
+        for node in self.graph.nodes.values():
+            if node.status not in (TaskState.COMPLETED, TaskState.VERIFIED, TaskState.FAILED, TaskState.BLOCKED, TaskState.CANCELLED):
+                try:
+                    node.status = TaskStateMachine.transition(node.status, TaskState.CANCELLED, node.task_id)
+                except Exception:
+                    node.status = TaskState.CANCELLED
+                if node.metadata is None:
+                    node.metadata = {}
+                node.metadata["failure_reason"] = f"Cancelled: {reason}"
+                evt = self.monitor.on_task_cancelled(node.task_id, node.task_name, reason=reason)
+                if hasattr(self, "_pending_events"):
+                    self._pending_events.append(evt)
+        self.monitor.update_counts_from_graph(self.graph)
+
+    @property
+    def is_cancelled(self) -> bool:
+        return getattr(self, "_is_cancelled", False)
 
     def resume(self) -> bool:
         """
@@ -1583,14 +1752,18 @@ class RuntimeEngine:
             try:
                 from execution.evidence.evidence_vault import EvidenceVault
                 from execution.browser.semantic_verifier import SemanticVerifier
-                evidence_items = EvidenceVault.get_session_evidence(
-                    session_id=self.session_id, user_id=self.user_id or "system"
+                clean_uid = str(self.user_id or getattr(self.graph, "user_id", None) or "").strip()
+                evidence_items = (
+                    EvidenceVault.get_session_evidence(session_id=self.session_id, user_id=clean_uid)
+                    if clean_uid
+                    else []
                 )
                 self._goal_verification = SemanticVerifier.verify_goal_outcome(
                     goal_text=self.goal_id or self.session_id,
                     graph=self.graph,
                     session_id=self.session_id,
                     evidence_items=evidence_items,
+                    user_id=clean_uid if clean_uid else None,
                 )
             except Exception as e:
                 logger.warning(f"[RuntimeEngine] Computing goal verification note: {e}")
@@ -1599,7 +1772,11 @@ class RuntimeEngine:
 
     def get_current_state(self) -> dict:
         """Serialise current engine state for GET /orchestrate/{id}/state."""
+        self.monitor.update_counts_from_graph(self.graph)
         goal_verif = self.get_goal_verification()
+        g_meta = getattr(self.graph, "metadata", {}) if isinstance(getattr(self.graph, "metadata", None), dict) else {}
+        is_fb = self._is_fallback_graph()
+        fb_reason = getattr(self.graph, "fallback_reason", None) or g_meta.get("fallback_reason")
         return {
             "session_id": self.session_id,
             "mode": self.mode,
@@ -1616,4 +1793,12 @@ class RuntimeEngine:
             "stability_events": self.stability_guard.get_stability_events(limit=5),
             "weight_suggestion": self.weight_optimizer.get_latest_suggestion(),
             "goal_verification": goal_verif.to_dict() if goal_verif and hasattr(goal_verif, "to_dict") else None,
+            "plan_hash": getattr(self.graph, "plan_hash", None),
+            "is_fallback": is_fb,
+            "fallback_reason": fb_reason,
+            "planning_mode": g_meta.get("planning_mode", "deterministic_fallback" if is_fb else "primary_ai"),
+            "provider_used": g_meta.get("provider_used"),
+            "primary_failure_code": g_meta.get("primary_failure_code"),
+            "validation_passed": bool(g_meta.get("validation_passed", True)),
+            "limitations": list(g_meta.get("limitations", [])),
         }

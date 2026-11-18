@@ -280,8 +280,21 @@ async def test_runtime_engine_verifies_cryptographic_approval(setup_auth_sqlite)
     user, _ = _create_test_user_and_token(db)
     session_id = "ardo_runtime_approval_test"
 
+    from execution.registry.tool_models import ToolCall
     nodes = [
-        {"id": "t1", "type": "default", "data": {"label": "Gated Action"}}
+        {
+            "id": "t1",
+            "type": "default",
+            "data": {
+                "label": "Gated Action",
+                "tool_call": ToolCall(
+                    call_id="call_gated_1",
+                    tool_name="calculator",
+                    action_name="evaluate",
+                    arguments={"expression": "100 + 1"},
+                ),
+            },
+        }
     ]
     graph = DAGBuilder.build(nodes, [], goal_text="Gated operation")
     node = graph.get_node("t1")

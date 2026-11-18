@@ -142,14 +142,23 @@ async def inspect_session_page(
         )
 
     page = None
+    executor_obj = None
     if hasattr(active_session, "browser_adapter") and active_session.browser_adapter:
-        page = getattr(active_session.browser_adapter.executor, "_page", None)
+        executor_obj = getattr(active_session.browser_adapter, "executor", None)
+        page = getattr(executor_obj, "_page", None)
+    if not page and hasattr(active_session, "engine") and getattr(active_session.engine, "browser_adapter", None):
+        executor_obj = getattr(active_session.engine.browser_adapter, "executor", None)
+        page = getattr(executor_obj, "_page", None)
 
     if not page:
         raise HTTPException(status_code=404, detail=f"No active browser page for session {session_id}")
 
-    engine = EnvironmentPerceptionEngine()
-    snapshot = await engine.inspect(page)
+    from execution.browser.playwright_executor import PlaywrightBrowserExecutor
+    if isinstance(executor_obj, PlaywrightBrowserExecutor):
+        snapshot = await executor_obj.inspect_page()
+    else:
+        engine = EnvironmentPerceptionEngine()
+        snapshot = await engine.inspect(page)
     snapshot_data = snapshot.to_dict() if hasattr(snapshot, "to_dict") else snapshot.model_dump()
 
     # Defense-in-depth: Ensure any sensitive input values in serialized snapshot elements are strictly redacted
@@ -227,10 +236,27 @@ async def create_plan(
 
     user_id = current_user["id"] if current_user else None
     start_t = time.time()
+    from ai.input_guard import InputReviewRequiredError, InputDeniedError
     try:
         plan = await generate_task_graph(request.goal, user_id=user_id)
         metrics_collector.record_planning(time.time() - start_t, success=True)
         return plan
+    except InputReviewRequiredError as ire:
+        metrics_collector.record_planning(time.time() - start_t, success=False)
+        gr = ire.guard_result
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "status": "review_required",
+                "message": gr.reason if gr else str(ire),
+                "risk_score": gr.risk_score if gr else 0.5,
+                "flagged_patterns": gr.flagged_patterns if gr else [],
+                "requires_clarification": True,
+            },
+        )
+    except (InputDeniedError, ValueError) as ve:
+        metrics_collector.record_planning(time.time() - start_t, success=False)
+        raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         metrics_collector.record_planning(time.time() - start_t, success=False)
         raise e
@@ -255,6 +281,7 @@ async def start_orchestration(
     5. Return session_id + initial graph state.
     """
     from core.config import settings
+    from ai.input_guard import InputReviewRequiredError, InputDeniedError
 
     user_id = current_user["id"]
 
@@ -277,7 +304,22 @@ async def start_orchestration(
         )
 
     # Step 1: Generate plan
-    plan = await generate_task_graph(request.goal, user_id=user_id)
+    try:
+        plan = await generate_task_graph(request.goal, user_id=user_id)
+    except InputReviewRequiredError as ire:
+        gr = ire.guard_result
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "status": "review_required",
+                "message": gr.reason if gr else str(ire),
+                "risk_score": gr.risk_score if gr else 0.5,
+                "flagged_patterns": gr.flagged_patterns if gr else [],
+                "requires_clarification": True,
+            },
+        )
+    except (InputDeniedError, ValueError) as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
 
     # Step 2: Build session
     session_id = f"ardo_{uuid.uuid4().hex[:10]}"
@@ -296,6 +338,10 @@ async def start_orchestration(
         except Exception as e:
             logger.warning(f"[Router] Could not update goal state to executing: {e}")
 
+    is_fallback = bool(getattr(plan.metadata, "is_fallback", False))
+    fallback_reason = getattr(plan.metadata, "fallback_reason", None)
+    planning_metadata = plan.metadata.model_dump() if hasattr(plan.metadata, "model_dump") else {}
+
     session = await ARDOScheduler.start(
         plan_nodes=nodes_data,
         plan_edges=edges_data,
@@ -305,6 +351,9 @@ async def start_orchestration(
         db=db,
         safety_decisions=getattr(plan, "safety_decisions", None) or {},
         user_id=user_id,
+        is_fallback=is_fallback,
+        fallback_reason=fallback_reason,
+        planning_metadata=planning_metadata,
     )
 
     graph = session.graph
@@ -328,6 +377,15 @@ async def start_orchestration(
         parallel_groups=graph.parallel_groups,
         initial_queue=session.engine._execution_queue[:10],
         initial_graph=initial_graph,
+        plan_hash=getattr(graph, "plan_hash", None),
+        is_fallback=is_fallback,
+        fallback_reason=fallback_reason,
+        planning_mode=getattr(plan.metadata, "planning_mode", "deterministic_fallback" if is_fallback else "primary_ai"),
+        provider_used=getattr(plan.metadata, "provider_used", None),
+        primary_failure_code=getattr(plan.metadata, "primary_failure_code", None),
+        validation_passed=bool(getattr(plan.metadata, "validation_passed", True)),
+        limitations=list(getattr(plan.metadata, "limitations", []) or []),
+        requires_clarification=bool(getattr(plan.metadata, "requires_clarification", False)),
     )
 
 
@@ -394,8 +452,8 @@ async def approve_task(
                 detail=f"Plan hash mismatch. Provided: {submitted_hash}, expected: {expected_hash}. Plan has been modified or hash is stale."
             )
 
-        session.approve_task(task_id)
-
+        # AUD-S3-08: Persist approval record before updating in-memory task state.
+        # If persistence fails, fail closed: the task remains unapproved.
         plan_hash = expected_hash
         approval_id = None
         expires_at = None
@@ -410,11 +468,19 @@ async def approve_task(
                 task_id=task_id,
                 metadata={"notes": body.notes} if body.notes else {},
             )
-            if rec and isinstance(rec, dict):
-                approval_id = rec.get("id")
-                expires_at = rec.get("expires_at")
+            if not rec or not isinstance(rec, dict) or not rec.get("id"):
+                raise RuntimeError("AuthDatabase failed to return valid persisted approval record.")
+            approval_id = rec.get("id")
+            expires_at = rec.get("expires_at")
         except Exception as e:
-            logger.warning(f"Failed to persist plan approval record: {e}")
+            logger.error(f"Failed to persist plan approval record: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to persist plan approval record. Task remains unapproved."
+            )
+
+        # In-memory approval state change executed ONLY after guaranteed database persistence
+        session.approve_task(task_id)
 
         res_data = {
             "status": "approved",
@@ -514,6 +580,18 @@ async def resume_orchestration(
         "remaining_tasks": remaining_count,
         "total_tasks": total_count,
     }
+
+
+@router.post("/orchestrate/{session_id}/cancel")
+async def cancel_orchestration(
+    session_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Safely cancel an ARDO execution session with tenant ownership validation."""
+    success = await ARDOScheduler.cancel_session(session_id, user_id=current_user["id"])
+    if not success:
+        raise HTTPException(status_code=404, detail=f"Session {session_id} not found or access denied.")
+    return {"session_id": session_id, "status": "cancelled"}
 
 
 @router.get("/orchestrate/{session_id}/metrics")
@@ -771,22 +849,61 @@ def search_memories(
     return [m.model_dump() for m in memories]
 
 
+@router.get("/knowledge/memories/{memory_id}")
+def get_memory_by_id_endpoint(
+    memory_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    Retrieve a specific historical execution memory by ID with strict tenant isolation.
+    """
+    from knowledge.rag_service import RAGService
+    rag = RAGService.get_instance()
+    if not rag.memory_store:
+        raise HTTPException(status_code=404, detail=f"Memory '{memory_id}' not found.")
+    mem = rag.memory_store.get_memory_by_id(memory_id=memory_id, user_id=current_user["id"])
+    if not mem:
+        raise HTTPException(status_code=404, detail=f"Memory '{memory_id}' not found.")
+    return mem.model_dump()
+
+
+@router.delete("/knowledge/memories/{memory_id}")
+def delete_memory_by_id_endpoint(
+    memory_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    Delete or invalidate a tenant-owned memory record by ID.
+    """
+    from knowledge.rag_service import RAGService
+    rag = RAGService.get_instance()
+    if not rag.memory_store:
+        raise HTTPException(status_code=404, detail=f"Memory '{memory_id}' not found.")
+    deleted = rag.memory_store.delete_memory(memory_id=memory_id, user_id=current_user["id"])
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Memory '{memory_id}' not found.")
+    return {"status": "deleted", "memory_id": memory_id}
+
+
 @router.post("/knowledge/ingest")
 def ingest_knowledge(
     req: IngestTextRequest,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """
-    Ingest a document into the PostgreSQL + pgvector knowledge store.
+    Ingest a document into the PostgreSQL + pgvector knowledge store with tenant binding.
     """
     from knowledge.rag_service import RAGService
     rag = RAGService.get_instance()
+    clean_meta = dict(req.metadata or {})
+    clean_meta["user_id"] = current_user["id"]
     report = rag.ingest_raw_text(
         title=req.title,
         content=req.content,
         source=req.source,
         category=req.category,
-        metadata=req.metadata,
+        metadata=clean_meta,
+        user_id=current_user["id"],
     )
     return report.model_dump()
 
@@ -809,6 +926,19 @@ async def list_playbooks(
         status=status,
     )
     return {"playbooks": playbooks, "total": len(playbooks)}
+
+
+@router.get("/playbooks/{playbook_id}")
+async def get_playbook_endpoint(
+    playbook_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """Retrieve a single tenant-owned playbook by ID."""
+    from knowledge.playbook_service import PlaybookService
+    pb = PlaybookService.get_playbook_by_id(playbook_id=playbook_id, user_id=current_user["id"])
+    if not pb:
+        raise HTTPException(status_code=404, detail=f"Playbook '{playbook_id}' not found.")
+    return pb
 
 
 @router.post("/playbooks/{playbook_id}/promote")

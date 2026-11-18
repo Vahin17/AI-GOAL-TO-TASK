@@ -1974,9 +1974,16 @@ class AuthDatabase:
     ) -> List[Dict[str, Any]]:
         """
         Retrieves playbooks for a user with optional category and status filtering.
+        Quarantined records are strictly excluded regardless of caller-supplied status filters.
         """
-        query = "SELECT * FROM playbooks WHERE user_id = ?"
-        params: List[Any] = [user_id]
+        clean_uid = str(user_id or "").strip()
+        if not clean_uid:
+            return []
+        if status and status.strip().lower() == "quarantined":
+            return []
+
+        query = "SELECT * FROM playbooks WHERE user_id = ? AND status != 'quarantined'"
+        params: List[Any] = [clean_uid]
         if category:
             query += " AND workflow_category = ?"
             params.append(category)
@@ -2024,13 +2031,14 @@ class AuthDatabase:
         self, playbook_id: str, user_id: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
         """
-        Retrieves a playbook by ID, optionally enforcing tenant ownership.
+        Retrieves a playbook by ID, strictly enforcing tenant ownership and excluding quarantined records.
         """
-        query = "SELECT * FROM playbooks WHERE id = ?"
-        params: List[Any] = [playbook_id]
-        if user_id:
-            query += " AND user_id = ?"
-            params.append(user_id)
+        clean_pid = str(playbook_id or "").strip()
+        clean_uid = str(user_id or "").strip()
+        if not clean_pid or not clean_uid:
+            return None
+        query = "SELECT * FROM playbooks WHERE id = ? AND user_id = ? AND status != 'quarantined'"
+        params: List[Any] = [clean_pid, clean_uid]
 
         if self._is_pg and self._pg_conn:
             pg_query = query.replace("?", "%s")
@@ -2072,7 +2080,13 @@ class AuthDatabase:
     ) -> bool:
         """
         Updates playbook status (candidate -> promoted, deprecated, revoked) with version bump.
+        Strictly enforces tenant ownership and prevents quarantined records from being promoted.
         """
+        clean_pid = str(playbook_id or "").strip()
+        clean_uid = str(user_id or "").strip()
+        if not clean_pid or not clean_uid:
+            return False
+
         now_str = datetime.now(timezone.utc).isoformat()
         now_dt = datetime.now(timezone.utc)
 
@@ -2082,18 +2096,15 @@ class AuthDatabase:
                     sql = """
                     UPDATE playbooks
                     SET status = %s, version = version + 1, last_used_at = NOW()
-                    WHERE id = %s
+                    WHERE id = %s AND user_id = %s AND status != 'quarantined'
                     """
                 else:
                     sql = """
                     UPDATE playbooks
                     SET status = %s, last_used_at = NOW()
-                    WHERE id = %s
+                    WHERE id = %s AND user_id = %s AND status != 'quarantined'
                     """
-                params = [status, playbook_id]
-                if user_id:
-                    sql += " AND user_id = %s"
-                    params.append(user_id)
+                params = [status, clean_pid, clean_uid]
                 cur.execute(sql, tuple(params))
                 return cur.rowcount > 0
         elif self._sqlite_conn:
@@ -2102,19 +2113,16 @@ class AuthDatabase:
                 sql = """
                 UPDATE playbooks
                 SET status = ?, version = version + 1, last_used_at = ?
-                WHERE id = ?
+                WHERE id = ? AND user_id = ? AND status != 'quarantined'
                 """
-                params = [status, now_str, playbook_id]
+                params = [status, now_str, clean_pid, clean_uid]
             else:
                 sql = """
                 UPDATE playbooks
                 SET status = ?, last_used_at = ?
-                WHERE id = ?
+                WHERE id = ? AND user_id = ? AND status != 'quarantined'
                 """
-                params = [status, now_str, playbook_id]
-            if user_id:
-                sql += " AND user_id = ?"
-                params.append(user_id)
+                params = [status, now_str, clean_pid, clean_uid]
             cur.execute(sql, tuple(params))
             self._sqlite_conn.commit()
             return cur.rowcount > 0
@@ -2150,10 +2158,18 @@ class AuthDatabase:
             return cur.rowcount
         return 0
 
-    def record_playbook_outcome(self, playbook_id: str, success: bool) -> None:
+    def record_playbook_outcome(self, playbook_id: str, success: bool, user_id: str) -> bool:
         """
         Updates success/failure counts and adjusts confidence score dynamically.
+        AUD-S3-07: Enforces tenant isolation and rejects updates on quarantined playbooks.
+        Returns True if an active record was updated, False otherwise.
         """
+        clean_pid = str(playbook_id or "").strip()
+        clean_uid = str(user_id or "").strip()
+        if not clean_pid or not clean_uid:
+            logger.warning("[AuthDatabase] record_playbook_outcome rejected: missing playbook_id or user_id.")
+            return False
+
         if self._is_pg and self._pg_conn:
             with self._pg_conn.cursor() as cur:
                 if success:
@@ -2163,9 +2179,9 @@ class AuthDatabase:
                         SET success_count = success_count + 1,
                             confidence_score = LEAST(0.99, confidence_score + 0.05),
                             last_used_at = NOW()
-                        WHERE id = %s;
+                        WHERE id = %s AND user_id = %s AND status != 'quarantined';
                         """,
-                        (playbook_id,),
+                        (clean_pid, clean_uid),
                     )
                 else:
                     cur.execute(
@@ -2174,10 +2190,11 @@ class AuthDatabase:
                         SET failure_count = failure_count + 1,
                             confidence_score = GREATEST(0.1, confidence_score - 0.15),
                             last_used_at = NOW()
-                        WHERE id = %s;
+                        WHERE id = %s AND user_id = %s AND status != 'quarantined';
                         """,
-                        (playbook_id,),
+                        (clean_pid, clean_uid),
                     )
+                return cur.rowcount > 0
         elif self._sqlite_conn:
             cur = self._sqlite_conn.cursor()
             now_str = datetime.now(timezone.utc).isoformat()
@@ -2188,9 +2205,9 @@ class AuthDatabase:
                     SET success_count = success_count + 1,
                         confidence_score = MIN(0.99, confidence_score + 0.05),
                         last_used_at = ?
-                    WHERE id = ?;
+                    WHERE id = ? AND user_id = ? AND status != 'quarantined';
                     """,
-                    (now_str, playbook_id),
+                    (now_str, clean_pid, clean_uid),
                 )
             else:
                 cur.execute(
@@ -2199,10 +2216,12 @@ class AuthDatabase:
                     SET failure_count = failure_count + 1,
                         confidence_score = MAX(0.1, confidence_score - 0.15),
                         last_used_at = ?
-                    WHERE id = ?;
+                    WHERE id = ? AND user_id = ? AND status != 'quarantined';
                     """,
-                    (now_str, playbook_id),
+                    (now_str, clean_pid, clean_uid),
                 )
             self._sqlite_conn.commit()
+            return cur.rowcount > 0
+        return False
 
 

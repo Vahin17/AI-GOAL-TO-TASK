@@ -21,12 +21,16 @@ import { cn } from '@/lib/utils';
 export type ARDONodeStatus =
   | 'pending'
   | 'waiting'
+  | 'ready'
   | 'active'
   | 'retrying'
   | 'completed'
+  | 'verified'
   | 'failed'
   | 'blocked'
-  | 'approval_needed';
+  | 'approval_needed'
+  | 'paused'
+  | 'cancelled';
 
 export type TaskNodeData = {
   label: string;
@@ -44,6 +48,10 @@ export type TaskNodeData = {
   taskId?: string;
   factorBreakdown?: Record<string, number>;
   blockedReason?: string;
+  failureReason?: string | null;
+  verificationStatus?: string;
+  isVerified?: boolean;
+  artifactHash?: string | null;
 };
 
 // ── Status Configuration ───────────────────────────────────────────────────
@@ -61,7 +69,7 @@ const STATUS_CONFIG: Record<
   }
 > = {
   pending: {
-    label: 'Queued',
+    label: 'Pending',
     dotClass: 'bg-zinc-300',
     ringClass: 'border-zinc-200',
     bgClass: 'bg-white',
@@ -77,6 +85,15 @@ const STATUS_CONFIG: Record<
     textClass: 'text-sky-500',
     icon: Hourglass,
     animate: false,
+  },
+  ready: {
+    label: 'Ready',
+    dotClass: 'bg-sky-500 animate-pulse',
+    ringClass: 'border-sky-300 shadow-[0_0_12px_rgba(14,165,233,0.2)]',
+    bgClass: 'bg-sky-50/50',
+    textClass: 'text-sky-600',
+    icon: Hourglass,
+    animate: true,
   },
   active: {
     label: 'Running',
@@ -97,11 +114,20 @@ const STATUS_CONFIG: Record<
     animate: true,
   },
   completed: {
-    label: 'Done',
+    label: 'Completed (Unverified)',
+    dotClass: 'bg-teal-500',
+    ringClass: 'border-teal-300/60',
+    bgClass: 'bg-teal-50/20',
+    textClass: 'text-teal-700',
+    icon: CheckCircle2,
+    animate: false,
+  },
+  verified: {
+    label: 'Verified',
     dotClass: 'bg-emerald-500',
-    ringClass: 'border-emerald-200/60',
-    bgClass: 'bg-emerald-50/20',
-    textClass: 'text-emerald-600',
+    ringClass: 'border-emerald-500/60 shadow-[0_0_20px_rgba(16,185,129,0.25)]',
+    bgClass: 'bg-emerald-50/30',
+    textClass: 'text-emerald-700',
     icon: CheckCircle2,
     animate: false,
   },
@@ -124,13 +150,31 @@ const STATUS_CONFIG: Record<
     animate: false,
   },
   approval_needed: {
-    label: 'Approval',
+    label: 'Approval Required',
     dotClass: 'bg-violet-500 animate-pulse',
     ringClass: 'border-violet-400/60 shadow-[0_0_20px_rgba(139,92,246,0.15)]',
     bgClass: 'bg-violet-50/30',
     textClass: 'text-violet-600',
     icon: ShieldAlert,
     animate: true,
+  },
+  paused: {
+    label: 'Paused',
+    dotClass: 'bg-slate-400',
+    ringClass: 'border-slate-300',
+    bgClass: 'bg-slate-50',
+    textClass: 'text-slate-500',
+    icon: Clock,
+    animate: false,
+  },
+  cancelled: {
+    label: 'Cancelled',
+    dotClass: 'bg-zinc-400',
+    ringClass: 'border-zinc-300',
+    bgClass: 'bg-zinc-100/50',
+    textClass: 'text-zinc-500',
+    icon: Ban,
+    animate: false,
   },
 };
 
@@ -285,6 +329,34 @@ const TaskNodeCard = ({ data, selected }: NodeProps<Node<TaskNodeData>>) => {
             {data.label}
           </h3>
         </div>
+
+        {/* ── Failure & Cancellation Rationale ─────────────────────────────── */}
+        {(status === 'failed' || status === 'cancelled') && (data.failureReason || data.blockedReason) && (
+          <div className="bg-rose-50/70 border border-rose-200 rounded-xl p-2.5 space-y-1">
+            <div className="flex items-center gap-1.5 text-[9px] font-bold text-rose-600 uppercase tracking-widest">
+              <AlertCircle className="h-3 w-3 shrink-0" />
+              <span>{status === 'cancelled' ? 'Cancellation Reason' : 'Failure Rationale'}</span>
+            </div>
+            <p className="text-[11px] font-mono text-rose-800 leading-tight break-words">
+              {data.failureReason || data.blockedReason}
+            </p>
+          </div>
+        )}
+
+        {/* ── Cryptographic Evidence Hash Badge ───────────────────────────────── */}
+        {data.artifactHash && data.artifactHash !== 'unverified' && (
+          <div className="flex items-center gap-1.5 px-2 py-1 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-800 text-[9px] font-mono font-bold">
+            <CheckCircle2 className="h-3 w-3 text-emerald-600 shrink-0" />
+            <span className="truncate">SHA: {data.artifactHash.substring(0, 16)}...</span>
+          </div>
+        )}
+
+        {status === 'completed' && (!data.artifactHash || data.artifactHash === 'unverified') && (
+          <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-lg bg-amber-50 border border-amber-200 text-amber-800 text-[9px] font-semibold">
+            <Clock className="h-3 w-3 text-amber-600 shrink-0" />
+            <span>Completed without empirical evidence</span>
+          </div>
+        )}
 
         {/* ── ARDO Metadata Row ──────────────────────────────────────── */}
         {(data.retryCount != null || data.executionType || data.parallelGroup != null) && (

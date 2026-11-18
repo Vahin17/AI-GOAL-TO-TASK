@@ -1,0 +1,198 @@
+{
+  "playbooks": [
+    {
+      "id": "pb_3ed0edabd366",
+      "user_id": "usr_e72e16a21169",
+      "workflow_category": "web_automation",
+      "goal_pattern": "goal_bec9df91",
+      "execution_steps": [
+        {
+          "tool": "browser",
+          "step_id": "task_4b3fcb6c",
+          "metadata": {
+            "evidence_id": "ev_0043c158a3694c",
+            "artifact_hash": "c6e0005581eee12b64be89eee6d7e68e82d76995ff9319772467dc24a4ff38f3",
+            "confidence_score": 0.95,
+            "verification_status": "verified"
+          },
+          "task_name": "Initialization Phase",
+          "browser_action": null
+        },
+        {
+          "tool": "browser",
+          "step_id": "task_24df9965",
+          "metadata": {
+            "evidence_id": "ev_8e9615199df34c",
+            "artifact_hash": "ae3f4525ac652341701812a456c659c098b883a03be2419cae12b69103ce0f85",
+            "confidence_score": 0.95,
+            "verification_status": "verified"
+          },
+          "task_name": "Execution Phase",
+          "browser_action": null
+        },
+        {
+          "tool": "browser",
+          "step_id": "task_5e029614",
+          "metadata": {
+            "evidence_id": "ev_8829089f895b48",
+            "artifact_hash": "a05a82cd2ad853a11d05be410f1804a3013231312148155fb94a5410623f4a00",
+            "confidence_score": 0.95,
+            "verification_status": "verified"
+          },
+          "task_name": "Verification Phase",
+          "browser_action": null
+        }
+      ],
+      "required_tools": [
+        "browser"
+      ],
+      "expected_outcomes": [
+        "Initialization Phase: completed and verified",
+        "Execution Phase: completed and verified",
+        "Verification Phase: completed and verified"
+      ],
+      "supporting_evidence_ids": [
+        "ev_0043c158a3694c",
+        "ev_8e9615199df34c",
+        "ev_8829089f895b48"
+      ],
+      "provenance_session_id": "ardo_208898fe9c",
+      "provenance_plan_hash": "e04c661107bd784473755486c95c11edf09f1b0eaec97d3277509acf485752cc",
+      "status": "candidate",
+      "confidence_score": 0.95,
+      "version": 1,
+      "metadata": {
+        "total_steps": 3,
+        "confidence_score": 0.95,
+        "verification_status": "verified",
+        "discovered_from_session": "ardo_208898fe9c"
+      },
+      "created_at": "2026-11-17 08:21:48.932034+00:00"
+    },
+    {
+      "id": "pb_f8b7ab912370",
+      "user_id": "usr_e72e16a21169",
+      "workflow_category": "web_automation",
+      "goal_pattern": "goal_ffcd3cde",
+      "execution_steps": [
+        {
+          "tool": "browser",
+          "step_id": "task_e6b9f746",
+          "metadata": {
+            "evidence_id": "ev_47a07204b89641",
+            "artifact_hash": "56466d305ea7cffa463df42a7f64e0abeab263c536323380cee176d54e83ace0",
+            "confidence_score": 0.95,
+            "verification_status": "verified"
+          },
+          "task_name": "Initialization Phase",
+          "browser_action": null
+        },
+        {
+          "tool": "browser",
+          "step_id": "task_69783ced",
+          "metadata": {
+            "evidence_id": "ev_2b3dec9fa40b46",
+            "artifact_hash": "7f8e4c6d27376e1556e60ca900a30891905d51ab431e7e5c75a605359395d0d7",
+            "confidence_score": 0.95,
+            "verification_status": "verified"
+          },
+          "task_name": "Execution Phase",
+          "browser_action": null
+        },
+        {
+          "tool": "browser",
+          "step_id": "task_f86c7b9a",
+          "metadata": {
+            "evidence_id": "ev_483214959f2a4e",
+            "artifact_hash": "bcc83e46624138bbe9dc48f8162eb233c78d19c98a9b88f8005f383aaf773a7c",
+            "confidence_score": 0.95,
+            "verification_status": "verified"
+          },
+          "task_name": "Verification Phase",
+          "browser_action": null
+        }
+      ],
+      "required_tools": [
+        "browser"
+      ],
+      "expected_outcomes": [
+        "Initialization Phase: completed and verified",
+        "Execution Phase: completed and verified",
+        "Verification Phase: completed and verified"
+      ],
+      "supporting_evidence_ids": [
+        "ev_47a07204b89641",
+        "ev_2b3dec9fa40b46",
+        "ev_483214959f2a4e"
+      ],
+      "provenance_session_id": "ardo_43c2900be7",
+      "provenance_plan_hash": "31c576d948cba74a10c60e19f53f4ce1fe3500ebc0e3212554a7a7a8a5844026",
+      "status": "candidate",
+      "confidence_score": 0.95,
+      "version": 1,
+      "metadata": {
+        "total_steps": 3,
+        "confidence_score": 0.95,
+        "verification_status": "verified",
+        "discovered_from_session": "ardo_43c2900be7"
+      },
+      "created_at": "2026-11-17 08:23:58.906951+00:00"
+    }
+  ],
+  "memories": [
+    {
+      "memory_id": "mem_651c95e43ab8",
+      "goal_text": "goal_bec9df91",
+      "plan_id": "goal_bec9df91",
+      "session_id": "ardo_208898fe9c",
+      "memory_type": "successful_plan",
+      "task_summary": "Executed 3 tasks: Initialization Phase [completed], Execution Phase [completed], Verification Phase [completed]",
+      "outcome_status": "success",
+      "execution_metrics": {
+        "tasks_total": 3,
+        "success_rate": 100.0,
+        "tasks_failed": 0,
+        "tasks_blocked": 0,
+        "tasks_completed": 3
+      },
+      "safety_summary": {
+        "blocked_count": 0
+      },
+      "metadata": {
+        "user_id": "usr_e72e16a21169",
+        "embedding_dim": 128,
+        "embedding_model": "deterministic-hash-128",
+        "embedding_space": "local_deterministic_fallback:deterministic-hash-128:128",
+        "embedding_provider": "local_deterministic_fallback (openai_quota_exhausted)"
+      },
+      "created_at": "2026-11-17 08:21:48.941492+00:00"
+    },
+    {
+      "memory_id": "mem_859b0e4920a5",
+      "goal_text": "goal_ffcd3cde",
+      "plan_id": "goal_ffcd3cde",
+      "session_id": "ardo_43c2900be7",
+      "memory_type": "successful_plan",
+      "task_summary": "Executed 3 tasks: Initialization Phase [completed], Execution Phase [completed], Verification Phase [completed]",
+      "outcome_status": "success",
+      "execution_metrics": {
+        "tasks_total": 3,
+        "success_rate": 100.0,
+        "tasks_failed": 0,
+        "tasks_blocked": 0,
+        "tasks_completed": 3
+      },
+      "safety_summary": {
+        "blocked_count": 0
+      },
+      "metadata": {
+        "user_id": "usr_e72e16a21169",
+        "embedding_dim": 128,
+        "embedding_model": "deterministic-hash-128",
+        "embedding_space": "local_deterministic_fallback:deterministic-hash-128:128",
+        "embedding_provider": "local_deterministic_fallback (openai_quota_exhausted)"
+      },
+      "created_at": "2026-11-17 08:24:00.246169+00:00"
+    }
+  ]
+}

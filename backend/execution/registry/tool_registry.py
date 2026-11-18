@@ -28,6 +28,15 @@ class ToolRegistry:
     def __init__(self, parent: Optional[ToolRegistry] = None):
         self._parent: Optional[ToolRegistry] = parent
         self._tools: Dict[str, BaseTool] = {}
+        if parent is None:
+            self._register_default_tools()
+
+    def _register_default_tools(self) -> None:
+        try:
+            from execution.registry.calculation_tool import CalculationTool
+            self.register(CalculationTool())
+        except Exception as e:
+            logger.debug(f"[ToolRegistry] Default tool registration note: {e}")
 
     @classmethod
     def get_instance(cls) -> ToolRegistry:

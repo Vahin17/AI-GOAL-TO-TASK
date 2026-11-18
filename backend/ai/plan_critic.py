@@ -102,6 +102,31 @@ class PlanCritic:
         - Detects unreachable steps / disconnected nodes
         """
         issues: List[CriticIssue] = []
+        seen_ids: Set[str] = set()
+        for n in nodes:
+            nid = str(getattr(n, "id", "") or "").strip()
+            label = str((n.data or {}).get("label", "") if isinstance(n.data, dict) else "").strip()
+            if not nid or not label:
+                issues.append(
+                    CriticIssue(
+                        step_id=nid or None,
+                        issue_type="invalid_task_structure",
+                        severity=CriticIssueSeverity.CRITICAL,
+                        message=f"Task node '{nid}' is missing a valid id or non-empty label.",
+                    )
+                )
+            elif nid in seen_ids:
+                issues.append(
+                    CriticIssue(
+                        step_id=nid,
+                        issue_type="duplicate_task_id",
+                        severity=CriticIssueSeverity.CRITICAL,
+                        message=f"Duplicate task node id '{nid}' detected in plan.",
+                    )
+                )
+            else:
+                seen_ids.add(nid)
+
         node_ids = {n.id for n in nodes}
 
         # 1. Missing node references in edges

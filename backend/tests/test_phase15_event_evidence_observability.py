@@ -559,11 +559,18 @@ def test_websocket_frontend_contract_compatibility():
 
 def test_non_browser_task_events_in_runtime():
     async def _test():
+        from execution.registry.tool_models import ToolCall
         graph = ARDOGraph()
         node = ARDOTaskNode(
             task_id="task_generic_1",
             task_name="Calculate mathematical hash",
             dependency_ids=[],
+            tool_call=ToolCall(
+                call_id="call_calc_obs_1",
+                tool_name="calculator",
+                action_name="evaluate",
+                arguments={"expression": "256 * 2"},
+            ),
         )
         graph.nodes[node.task_id] = node
         graph.adjacency[node.task_id] = []

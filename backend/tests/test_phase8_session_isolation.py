@@ -244,14 +244,14 @@ class TestSessionIsolation:
             mock_exec_b.stop = AsyncMock()
             adapter_b = BrowserTaskAdapter(executor=mock_exec_b)
 
-            session_a = ARDOSession(session_id="ardo_sess_1", graph=graph_a, mode="safe", browser_adapter=adapter_a)
-            session_b = ARDOSession(session_id="ardo_sess_2", graph=graph_b, mode="safe", browser_adapter=adapter_b)
+            session_a = ARDOSession(session_id="ardo_sess_1", graph=graph_a, mode="safe", browser_adapter=adapter_a, user_id="user_test")
+            session_b = ARDOSession(session_id="ardo_sess_2", graph=graph_b, mode="safe", browser_adapter=adapter_b, user_id="user_test")
 
             ARDOScheduler._sessions["ardo_sess_1"] = session_a
             ARDOScheduler._sessions["ardo_sess_2"] = session_b
 
             # Stop session 1
-            stopped = await ARDOScheduler.stop_session("ardo_sess_1")
+            stopped = await ARDOScheduler.stop_session("ardo_sess_1", user_id="user_test")
             assert stopped is True
             assert "ardo_sess_1" not in ARDOScheduler._sessions
             assert "ardo_sess_2" in ARDOScheduler._sessions
@@ -259,7 +259,7 @@ class TestSessionIsolation:
             mock_exec_b.stop.assert_not_called()
 
             # Clean up session 2
-            await ARDOScheduler.stop_session("ardo_sess_2")
+            await ARDOScheduler.stop_session("ardo_sess_2", user_id="user_test")
             mock_exec_b.stop.assert_called_once()
 
         asyncio.run(_run())

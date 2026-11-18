@@ -18,7 +18,7 @@ from __future__ import annotations
 import time
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Set, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from orchestration.dag_builder import ARDOGraph
@@ -71,9 +71,16 @@ class SessionMetrics:
     completed_at: Optional[float] = None
 
     tasks_total: int = 0
+    tasks_pending: int = 0
+    tasks_ready: int = 0
+    tasks_running: int = 0
+    tasks_approval_required: int = 0
+    tasks_paused: int = 0
     tasks_completed: int = 0
+    tasks_verified: int = 0
     tasks_failed: int = 0
     tasks_blocked: int = 0
+    tasks_cancelled: int = 0
     tasks_retried: int = 0
 
     total_retry_count: int = 0
@@ -104,7 +111,7 @@ class SessionMetrics:
         elapsed = self.elapsed_seconds
         if elapsed <= 0:
             return 0.0
-        return round((self.tasks_completed / elapsed) * 60, 2)
+        return round(((self.tasks_completed + self.tasks_verified) / elapsed) * 60, 2)
 
     @property
     def avg_latency_seconds(self) -> float:
@@ -113,12 +120,42 @@ class SessionMetrics:
         return round(sum(self.task_latencies) / len(self.task_latencies), 2)
 
     @property
-    def success_rate(self) -> float:
-        """Returns task completion ratio in range [0.0, 1.0]."""
-        total = self.tasks_total if self.tasks_total > 0 else (self.tasks_completed + self.tasks_failed)
-        if total == 0:
+    def execution_progress_pct(self) -> float:
+        """Percentage of tasks that finished execution vs total planned tasks."""
+        if self.tasks_total <= 0:
             return 0.0
-        return round(self.tasks_completed / total, 3)
+        finished = (
+            self.tasks_completed
+            + self.tasks_verified
+            + self.tasks_failed
+            + self.tasks_blocked
+            + self.tasks_cancelled
+        )
+        return min(100.0, round((finished / self.tasks_total) * 100.0, 1))
+
+    @property
+    def verification_progress_pct(self) -> float:
+        """Percentage of tasks authoritatively verified vs total planned tasks."""
+        if self.tasks_total <= 0:
+            return 0.0
+        return min(100.0, round((self.tasks_verified / self.tasks_total) * 100.0, 1))
+
+    @property
+    def success_rate(self) -> float:
+        """
+        Returns task success ratio in range [0.0, 1.0].
+        Never reports 1.0 while tasks remain unfinished, failed, blocked, or cancelled.
+        """
+        if self.tasks_total <= 0:
+            return 0.0
+        successful = self.tasks_verified if self.tasks_verified > 0 else (self.tasks_completed + self.tasks_verified)
+        if (self.tasks_failed + self.tasks_blocked + self.tasks_cancelled) > 0:
+            return round(successful / self.tasks_total, 3)
+        if (self.tasks_completed + self.tasks_verified) < self.tasks_total:
+            # Must not show 100% while tasks remain unfinished
+            ratio = successful / self.tasks_total
+            return round(min(ratio, 0.99), 3)
+        return round(successful / self.tasks_total, 3)
 
     @property
     def success_rate_percentage(self) -> float:
@@ -144,9 +181,16 @@ class SessionMetrics:
             "completed_at": self.completed_at,
             "elapsed_seconds": self.elapsed_seconds,
             "tasks_total": self.tasks_total,
+            "tasks_pending": self.tasks_pending,
+            "tasks_ready": self.tasks_ready,
+            "tasks_running": self.tasks_running,
+            "tasks_approval_required": self.tasks_approval_required,
+            "tasks_paused": self.tasks_paused,
             "tasks_completed": self.tasks_completed,
+            "tasks_verified": self.tasks_verified,
             "tasks_failed": self.tasks_failed,
             "tasks_blocked": self.tasks_blocked,
+            "tasks_cancelled": self.tasks_cancelled,
             "tasks_retried": self.tasks_retried,
             "total_retry_count": self.total_retry_count,
             "recovery_count": self.recovery_count,
@@ -156,6 +200,8 @@ class SessionMetrics:
             "avg_latency_seconds": self.avg_latency_seconds,
             "success_rate": self.success_rate,
             "success_rate_percentage": self.success_rate_percentage,
+            "execution_progress_pct": self.execution_progress_pct,
+            "verification_progress_pct": self.verification_progress_pct,
             "scheduler_efficiency_score": self.scheduler_efficiency_score,
             "parallelization_utilization_ratio": self.parallelization_utilization_ratio,
             "average_dependency_wait_duration": self.average_dependency_wait_duration,
@@ -206,6 +252,12 @@ class ExecutionMonitor:
         self.metrics = SessionMetrics(session_id=session_id)
         self._event_log: List[OrchestrationEvent] = []
         self._task_start_times: Dict[str, float] = {}
+        self._completed_task_ids: Set[str] = set()
+        self._verified_task_ids: Set[str] = set()
+        self._failed_task_ids: Set[str] = set()
+        self._blocked_task_ids: Set[str] = set()
+        self._cancelled_task_ids: Set[str] = set()
+        self._active_task_ids: Set[str] = set()
         
         # Track waiting start times for wait duration metric
         self._task_wait_start_times: Dict[str, float] = {}
@@ -227,13 +279,15 @@ class ExecutionMonitor:
     def on_task_started(self, task_id: str, task_name: str) -> OrchestrationEvent:
         now = time.time_ns() / 1e9
         self._task_start_times[task_id] = now
+        self._active_task_ids.add(task_id)
+        self.metrics.tasks_running = len(self._active_task_ids)
         
         # Update dependency wait duration metric
         if task_id in self._task_wait_start_times:
             wait_duration = now - self._task_wait_start_times.pop(task_id)
             # Rolling average
             current_avg = self.metrics.average_dependency_wait_duration
-            completed = self.metrics.tasks_completed
+            completed = self.metrics.tasks_completed + self.metrics.tasks_verified
             if completed == 0:
                 self.metrics.average_dependency_wait_duration = wait_duration
             else:
@@ -250,24 +304,62 @@ class ExecutionMonitor:
             status="active",
         ))
 
-    def on_task_completed(self, task_id: str, task_name: str) -> OrchestrationEvent:
+    def on_task_completed(
+        self,
+        task_id: str,
+        task_name: str,
+        is_verified: bool = False,
+        verification_status: str = "unverified",
+        artifact_hash: Optional[str] = None,
+    ) -> OrchestrationEvent:
         now = time.time_ns() / 1e9
         latency = now - self._task_start_times.pop(task_id, now)
         self.metrics.task_latencies.append(latency)
-        self.metrics.tasks_completed += 1
-        self.metrics.add_timeline_marker("complete", task_id, task_name, latency=latency)
+        self._active_task_ids.discard(task_id)
+        self.metrics.tasks_running = len(self._active_task_ids)
+
+        clean_vstatus = (verification_status or ("verified" if is_verified else "unverified")).lower()
+        is_ver = bool(is_verified or clean_vstatus == "verified")
+
+        if is_ver:
+            self._verified_task_ids.add(task_id)
+            self._completed_task_ids.discard(task_id)
+        else:
+            self._completed_task_ids.add(task_id)
+            self._verified_task_ids.discard(task_id)
+
+        self.metrics.tasks_completed = len(self._completed_task_ids)
+        self.metrics.tasks_verified = len(self._verified_task_ids)
+        self.metrics.add_timeline_marker(
+            "verified" if is_ver else "complete",
+            task_id,
+            task_name,
+            latency=latency,
+            is_verified=is_ver,
+            verification_status="verified" if is_ver else clean_vstatus,
+            artifact_hash=artifact_hash,
+        )
         return self.emit(OrchestrationEvent(
             event_type="task_completed",
             session_id=self.session_id,
             task_id=task_id,
             task_name=task_name,
-            status="completed",
-            details={"latency_seconds": latency},
+            status="verified" if is_ver else "completed",
+            details={
+                "latency_seconds": latency,
+                "is_verified": is_ver,
+                "verification_status": "verified" if is_ver else clean_vstatus,
+                "artifact_hash": artifact_hash,
+            },
         ))
 
     def on_task_failed(self, task_id: str, task_name: str, reason: str) -> OrchestrationEvent:
-        self.metrics.tasks_failed += 1
-        self.metrics.add_timeline_marker("fail", task_id, task_name, reason=reason)
+        self._active_task_ids.discard(task_id)
+        self.metrics.tasks_running = len(self._active_task_ids)
+        if task_id not in self._failed_task_ids:
+            self._failed_task_ids.add(task_id)
+            self.metrics.tasks_failed = len(self._failed_task_ids)
+            self.metrics.add_timeline_marker("fail", task_id, task_name, reason=reason)
         return self.emit(OrchestrationEvent(
             event_type="task_failed",
             session_id=self.session_id,
@@ -295,7 +387,10 @@ class ExecutionMonitor:
         ))
 
     def on_task_blocked(self, task_id: str, task_name: str, cause: str) -> OrchestrationEvent:
-        self.metrics.tasks_blocked += 1
+        self._active_task_ids.discard(task_id)
+        self.metrics.tasks_running = len(self._active_task_ids)
+        self._blocked_task_ids.add(task_id)
+        self.metrics.tasks_blocked = len(self._blocked_task_ids)
         return self.emit(OrchestrationEvent(
             event_type="task_blocked",
             session_id=self.session_id,
@@ -303,6 +398,31 @@ class ExecutionMonitor:
             task_name=task_name,
             status="blocked",
             details={"cause": cause},
+        ))
+
+    def on_task_cancelled(self, task_id: str, task_name: str, reason: str = "Session cancelled") -> OrchestrationEvent:
+        self._active_task_ids.discard(task_id)
+        self.metrics.tasks_running = len(self._active_task_ids)
+        self._cancelled_task_ids.add(task_id)
+        self.metrics.tasks_cancelled = len(self._cancelled_task_ids)
+        self.metrics.add_timeline_marker("cancel", task_id, task_name, reason=reason)
+        return self.emit(OrchestrationEvent(
+            event_type="task_cancelled",
+            session_id=self.session_id,
+            task_id=task_id,
+            task_name=task_name,
+            status="cancelled",
+            details={"reason": reason},
+        ))
+
+    def on_task_paused(self, task_id: Optional[str] = None, task_name: Optional[str] = None, reason: str = "Execution paused") -> OrchestrationEvent:
+        return self.emit(OrchestrationEvent(
+            event_type="task_paused",
+            session_id=self.session_id,
+            task_id=task_id,
+            task_name=task_name,
+            status="paused",
+            details={"reason": reason},
         ))
 
     def on_task_approved(self, task_id: str, task_name: str) -> OrchestrationEvent:
@@ -447,12 +567,31 @@ class ExecutionMonitor:
 
     def on_session_complete(self) -> OrchestrationEvent:
         self.metrics.completed_at = time.time_ns() / 1e9
+        is_all_verified = (
+            self.metrics.tasks_total > 0
+            and self.metrics.tasks_verified == self.metrics.tasks_total
+            and self.metrics.tasks_failed == 0
+            and self.metrics.tasks_blocked == 0
+            and self.metrics.tasks_cancelled == 0
+        )
         is_all_success = (
             self.metrics.tasks_total > 0
-            and self.metrics.tasks_completed == self.metrics.tasks_total
+            and (self.metrics.tasks_completed + self.metrics.tasks_verified) == self.metrics.tasks_total
             and self.metrics.tasks_failed == 0
+            and self.metrics.tasks_blocked == 0
+            and self.metrics.tasks_cancelled == 0
         )
-        status_str = "completed" if is_all_success else "failed"
+        if is_all_verified:
+            status_str = "verified"
+        elif is_all_success:
+            status_str = "completed"
+        elif self.metrics.tasks_blocked > 0:
+            status_str = "blocked"
+        elif self.metrics.tasks_cancelled > 0:
+            status_str = "cancelled"
+        else:
+            status_str = "failed"
+
         return self.emit(OrchestrationEvent(
             event_type="session_complete",
             session_id=self.session_id,
@@ -461,6 +600,71 @@ class ExecutionMonitor:
             status=status_str,
             details=self.metrics.to_dict(),
         ))
+
+    def update_counts_from_graph(self, graph: Any) -> None:
+        """
+        Synchronize all counter metrics directly from the authoritative ARDOGraph nodes.
+        Guarantees zero metric drift, zero double-counting, and full distinction between
+        pending, ready, running, waiting for approval, paused, completed, verified, failed,
+        blocked, and cancelled tasks.
+        """
+        if not graph or not hasattr(graph, "nodes"):
+            return self.metrics
+
+        nodes = list(graph.nodes.values()) if graph.nodes else []
+        self.metrics.tasks_total = len(nodes)
+
+        pending = 0
+        ready = 0
+        running = 0
+        approval = 0
+        paused = 0
+        completed = 0
+        verified = 0
+        failed = 0
+        blocked = 0
+        cancelled = 0
+
+        for n in nodes:
+            st = n.status.value if hasattr(n.status, "value") else str(n.status)
+            meta = getattr(n, "metadata", {}) or {}
+            v_status = str(meta.get("verification_status") or "").lower()
+            is_ver = bool(st == "verified" or (st == "completed" and v_status == "verified"))
+
+            if st == "pending":
+                pending += 1
+            elif st in ("waiting", "ready"):
+                ready += 1
+            elif st in ("active", "retrying"):
+                running += 1
+            elif st == "approval_needed":
+                approval += 1
+            elif st == "paused":
+                paused += 1
+            elif is_ver:
+                verified += 1
+            elif st == "completed":
+                completed += 1
+            elif st == "failed":
+                failed += 1
+            elif st == "blocked":
+                blocked += 1
+            elif st == "cancelled":
+                cancelled += 1
+            else:
+                pending += 1
+
+        self.metrics.tasks_pending = pending
+        self.metrics.tasks_ready = ready
+        self.metrics.tasks_running = running
+        self.metrics.tasks_approval_required = approval
+        self.metrics.tasks_paused = paused
+        self.metrics.tasks_completed = completed
+        self.metrics.tasks_verified = verified
+        self.metrics.tasks_failed = failed
+        self.metrics.tasks_blocked = blocked
+        self.metrics.tasks_cancelled = cancelled
+        return self.metrics
 
     # ── Persistence ────────────────────────────────────────────────────────
 

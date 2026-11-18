@@ -1,9 +1,106 @@
 # ARDO — Project Execution State Snapshot
 
-**Date:** 2026-11-17  
+**Date:** 2026-11-18  
 **Branch:** `stabilization-2-closure`  
-**Base Commit (HEAD):** `914d61a05b90c12679632b8c70c73667f5ae4539` (Pass A checkpoint commit)  
-**Working Tree Status:** 34 modified tracked files, 11 untracked items (`backend/core/retry_utils.py`, `backend/tests/test_embedding_dimension_compatibility.py`, `backend/tests/test_provider_recovery_t5.py`, `backend/tests/test_t4_verification_contracts.py`, `backend/tests/test_t6_live_pgvector_integration.py`, `backend/tests/test_t7_security_hardening.py`, `backend/tests/test_t7_1_security_remediation.py`, `backend/tests/test_t7_1_1_final_security_gap.py`, `backend/tests/test_t7_1_2_final_approval_integrity.py`, `backend/tests/test_t7_1_3_session_enumeration_remediation.py`), `docs/roadmap/`, 0 staged files.  
+**Base Commit (HEAD):** `bdaa78ef7c00a104d3a30089a6614e117fda291f` (`checkpoint(stage0b): preserve pre-remediation project state and roadmap evidence`)  
+**Status:** Stage 3 (Protect Memory, Playbooks and RAG) COMPLETE — Verdict: **PASS**; Awaiting Stage 4 Authorization  
+
+---
+
+## 0. Current Working-Tree Inventory (Stage 1 + Stage 2 + Stage 3 Changes)
+
+All Stage 1 (1A–1E), Stage 2, and Stage 3 work is preserved in the working tree (0 staged files):
+
+### Stage 3 Additional Modifications & Evidence
+- `backend/core/auth_db.py`: Enforced fail-closed non-empty `user_id` and mandatory `AND user_id = ? AND status != 'quarantined'` across `get_playbooks_for_user()`, `get_playbook_by_id()`, and `update_playbook_status()` (`DEF-S3-01`).
+- `backend/knowledge/semantic_memory.py`: Added explicit lifecycle and provenance fields (`source_type`, `trust_status`, `verification_status`, `evidence_hashes`, `updated_at`, `expires_at`, `superseded_by`, `version`) to `ExecutionMemoryItem`; enforced evidence-backed eligibility gating (downgrading fallback, unverified, or evidence-free runs claiming `"success"` to `"unverified"`/`"candidate"`), deduplication, contradiction/supersession resolution, expiration filtering, and tenant-isolated `get_memory_by_id()`, `approve_memory()`, `update_memory()`, `invalidate_memory()`, and `delete_memory()` (`DEF-S3-02`).
+- `backend/knowledge/playbook_service.py`: Enforced fail-closed `user_id` checks across all methods, required all graph nodes to be `completed`, bound `supporting_evidence_ids` and `supporting_evidence_hashes` strictly from `valid_evidence`, rejected fallback/unverified/empty-step promotion in `promote_candidate()`, excluded `deprecated`/`revoked`/`rejected`/`quarantined` playbooks in `retrieve_playbooks_for_goal()`, and neutralized prompt-injection delimiter breakout sequences in `format_playbook_for_context()` (`DEF-S3-03`).
+- `backend/knowledge/postgres_vector_store.py`, `backend/knowledge/context_assembler.py`, `backend/knowledge/rag_service.py`, & `backend/api/router.py`: Enforced `_is_chunk_retrievable()` quarantine/expiration/tenant filtering (`_viewer_user_id`), safe embedding failure containment without fabricated vectors, prompt-injection delimiter neutralization (`[REDACTED_TAG:...]`), `provenance.retrieval_status = "error"` on memory retrieval failures, authenticated tenant stamping on `POST /knowledge/ingest`, and tenant-isolated `GET /knowledge/memories/{memory_id}`, `DELETE /knowledge/memories/{memory_id}`, and `GET /playbooks/{playbook_id}` endpoints (`DEF-S3-04`).
+- `backend/knowledge/embeddings.py`: Scoped `_failed_api_key` on 401 authentication errors so invalid credentials on one key do not lock subsequent `HybridEmbeddingService` instances configured with `force_local=True` or a new key (`DEF-S3-05`).
+- `backend/tests/test_stage3_memory_playbooks_rag.py` & `docs/roadmap/evidence/ARDO_STAGE3_MEMORY_PLAYBOOKS_RAG_REPORT.md`: 52-scenario Stage 3 verification suite (`52/52 passed`) and comprehensive Stage 3 report.
+
+### Stage 1D Additional Modifications & Evidence
+- `backend/orchestration/dag_builder.py`: Added `is_fallback`, `fallback_reason`, `metadata`, and `is_fallback_plan()` to `ARDOGraph` (`DEF-1C-01`).
+- `backend/orchestration/scheduler.py`: Propagated `is_fallback` into `ARDOGraph`; enforced `session_id` and `user_id` scoping in `get_evidence()`, removed `"verified" if node.status.value == "completed"` fallback, and fixed `or 1.0` confidence bug (`DEF-1C-01`, `DEF-1C-02`).
+- `backend/orchestration/runtime_engine.py`: Added `_is_fallback_graph()` blocking candidate playbook synthesis and forcing semantic memory `outcome_status = "unverified"` on fallback plans (`DEF-1C-01`); persisted `ToolResult.output_data` and rejected empty tool outputs (`DEF-1C-07`); included task ID/name in browser verification payload (`DEF-1C-08`).
+- `backend/execution/browser/semantic_verifier.py`: Added `_is_valid_vault_evidence()` enforcing `session_id`, `task_id`, `user_id`, `plan_hash`, and non-empty `artifact_hash`; added `file://` URL verification and media title goal-text token fallback (`DEF-1C-02`, `DEF-1C-07`, `DEF-1C-08`).
+- `backend/execution/evidence/evidence_vault.py`: Downgraded empty/missing `raw_content` records to `"unverified"`, `confidence_score = 0.0`, `artifact_hash = "unverified"` (`DEF-1C-02`).
+- `backend/execution/browser/playwright_executor.py`: Extracted `_inspect_page_unlocked()` and updated `_execute_action_locked()` on `BrowserActionType.INSPECT_PAGE` to eliminate `_op_lock` non-reentrant self-deadlock.
+- `backend/api/router.py`: Updated `inspect_session_page` to fall back to `active_session.engine.browser_adapter` and delegate live `PlaywrightBrowserExecutor` inspection through `await executor.inspect_page()`.
+- `backend/core/auth_db.py` & `backend/knowledge/playbook_service.py`: Hardened `get_playbooks_for_user()` and `get_playbook_by_id()` to unconditionally exclude `status == 'quarantined'` (`DEF-1C-04`).
+- `backend/ai/fallback_rules.py`: Replaced substring matching with word-boundary regexes (`\b...\b`) and removed standalone `"verify"` browser trigger (`DEF-1C-05`).
+- `frontend/src/components/panels/ExecutionControl.tsx` & `frontend/src/store/useARDOStore.ts`: Enforced strict verified evidence checks, amber `'completed (unverified)'` styling, session-scoped verification reset, and idempotent failed/blocked task counters (`DEF-1C-03`).
+- `docs/roadmap/evidence/ARDO_STAGE1C_INDEPENDENT_VERIFICATION_REPORT.md`, `docs/roadmap/evidence/ARDO_STAGE1D_TARGETED_CORRECTIONS_REPORT.md`, & `docs/roadmap/evidence/ARDO_STAGE1E_INDEPENDENT_VERIFICATION_REPORT.md`: Independent verification and Stage 1D/1E completion reports.
+
+### Stage 1D & Stage 1E Bounded Verification Matrix
+| Suite | Result | Duration | Notes |
+| :--- | :--- | :--- | :--- |
+| **Stage 1E Combined Backend Verification (`task-23823`)** | **162 passed, 0 failed, 1 skipped** | `23.95s` | 17 test suites across false-success remediation, offline Chromium acceptance, security (T7..T7.1.3), T4 contracts, T5 recovery, and Phase 14/15 (`120s` timeout) |
+| `test_phase15_perception.py -k test_15_8_registry_dispatch` | **1 passed, 11 deselected** | `15.84s` | Previously hanging test resolved (`60s` timeout) |
+| `test_phase15_perception.py` (selected subset) | **7 passed, 5 deselected** | `35.43s` | `test_15_1, 4, 7, 8, 9, 10, 12` passed (`120s` timeout); 5 deselected legacy `ActionSynthesizer` tests assessed individually in Stage 1E report |
+| `test_false_success_remediation.py` | **19 passed** | `7.13s` | Scenarios 1–15 + `DEF-1C-01..07` + `_op_lock` deadlock & concurrency serialization test |
+| `test_offline_chromium_acceptance.py` | **4 passed** | `5.2s` | Full orchestration pipeline (`DEF-1C-08`) + fail-closed Chromium acceptance |
+| Frontend `npx tsc --noEmit` (Stage 1E) & `npm run build` | **PASSED (0 errors)** | `11.0s` / `16.0s` | 9/9 static pages built |
+
+---
+
+## 1. Historical Working-Tree Inventory (Stage 1B Baseline)
+
+All Stage 1B remediation work is preserved in the working tree without uncommitted loss:
+
+### A. Modified Tracked Files (19 files)
+1. `backend/ai/fallback_rules.py`: Media-aware heuristic decomposition (5 discrete browser tasks for play/media goals), `is_fallback: True`, realistic confidence (0.60).
+2. `backend/ai/orchestrator.py`: Passes `is_fallback=True` and sanitized `fallback_reason` on provider failure.
+3. `backend/api/router.py`: Exposes `is_fallback` and `fallback_reason` in `ARDOSessionResponse`.
+4. `backend/core/auth_db.py`: Excludes `status == 'quarantined'` from playbook retrieval (`get_playbooks_for_user`).
+5. `backend/execution/browser/semantic_verifier.py`: Complete decoupling of task completion from verification; weakest-link goal confidence; unverified completed tasks yield `overall_status = "unverified"`.
+6. `backend/execution/registry/tool_registry.py`: Registers `CalculationTool` by default in global and session scopes.
+7. `backend/knowledge/playbook_service.py`: Excludes quarantined playbooks from goal retrieval; rejects candidate playbook generation for unverified goals or empty evidence.
+8. `backend/knowledge/semantic_memory.py`: Excludes `outcome_status == 'quarantined'` from pgvector, tsvector, and local in-memory queries.
+9. `backend/orchestration/execution_monitor.py`: Idempotent task completion and failure tracking via `_completed_task_ids` and `_failed_task_ids`.
+10. `backend/orchestration/runtime_engine.py`: Elimination of simulated generic task execution; unbound tasks fail closed immediately; non-browser tools execute via registered tool contracts; candidates and memories require empirical proof.
+11. `backend/schemas/ardo_models.py`: Added `is_fallback` and `fallback_reason` to `ARDOSessionResponse`.
+12. `backend/schemas/models.py`: Added `is_fallback` and `fallback_reason` to `PlanGraphMetadata`.
+13. `backend/tests/test_fallback.py`: Updated assertions for 0.60 confidence and new deterministic labels.
+14. `backend/tests/test_gemini_failure_handling.py`: Replaced generic simulation in `test_6` with calculator tool contract.
+15. `backend/tests/test_phase15_perception.py`: Enforced fail-closed assertion on ungrounded generic tasks in `test_15_10`.
+16. `backend/tests/test_plan_approval.py`: Updated gated test node with calculator tool contract to verify cryptographic approval.
+17. `frontend/src/components/panels/ExecutionControl.tsx`: Truthful runtime state badge (requires empirical evidence for `verified`), added amber heuristic fallback banner with reason.
+18. `frontend/src/lib/ardo-api.ts`: Added `is_fallback` and `fallback_reason` to `ARDOSessionResponse`; added `'unverified'` to `GoalVerificationResponse.overall_status`.
+19. `frontend/src/store/useARDOStore.ts`: Added `isFallbackPlan` and `fallbackReason` state variables, reset hooks, and session response mapping.
+
+### B. Untracked Files (7 files)
+1. `backend/execution/registry/calculation_tool.py`: AST-safe mathematical evaluator (`CalculationTool`).
+2. `backend/tests/fixtures/mock_youtube.html`: Deterministic local fixture with search, video result, player view, and observable playback state.
+3. `backend/tests/test_false_success_remediation.py`: 14 comprehensive regression tests covering Scenarios 1–15.
+4. `backend/tests/test_offline_chromium_acceptance.py`: Genuine offline Chromium acceptance tests on local fixture using real Playwright.
+5. `docs/roadmap/evidence/ARDO_FALSE_SUCCESS_QUARANTINE_AUDIT.md`: Complete audit trail of database record quarantine.
+6. `docs/roadmap/evidence/ARDO_STAGE1A_FALSE_SUCCESS_REMEDIATION_SPEC.md`: Approved Stage 1A engineering specification.
+7. `docs/roadmap/evidence/quarantine_backup_records.json`: Transactional backup of the 4 quarantined database records.
+
+---
+
+## 2. Database Quarantine State
+
+Four records generated during false-success runs were quarantined via reversible transaction in PostgreSQL `ai_goal_planner`:
+- `playbooks`: `pb_f8b7ab912370` (`status = 'quarantined'`)
+- `playbooks`: `pb_3ed0edabd366` (`status = 'quarantined'`)
+- `execution_memories`: `mem_859b0e4920a5` (`outcome_status = 'quarantined'`)
+- `execution_memories`: `mem_651c95e43ab8` (`outcome_status = 'quarantined'`)
+Verified: 0 playbooks and 0 memories returned for the user or goal text. Full backup saved to `docs/roadmap/evidence/quarantine_backup_records.json`.
+
+---
+
+## 3. Test Verification Matrix
+
+| Suite | Tests | Result | Duration | Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| `test_false_success_remediation.py` | 14 | **PASSED** | 5.78s | Scenarios 1–15 fully verified |
+| `test_offline_chromium_acceptance.py` | 2 | **PASSED** | 1.94s | Real Playwright Chromium on `mock_youtube.html` |
+| `test_gemini_failure_handling.py` | 6 | **PASSED** | 0.59s | Failure handling & calculator tool contracts |
+| `test_fallback.py` | 1 | **PASSED** | 0.15s | Deterministic schema & truthful fallback metadata |
+| `test_plan_approval.py` | 7 | **PASSED** | 2.50s | Cryptographic approval verification & persistence |
+| Frontend Type-Check (`tsc --noEmit`) | Whole project | **PASSED** | 9.0s | 0 TypeScript errors |  
 
 ---
 

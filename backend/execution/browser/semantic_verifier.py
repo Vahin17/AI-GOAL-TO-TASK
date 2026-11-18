@@ -47,10 +47,13 @@ _STOP_WORDS: Set[str] = {
     "browser", "tab", "verify", "check", "make", "sure", "that", "this",
     "search", "find", "play", "type", "fill", "select", "look", "watch", "correct",
     "interact", "content", "element", "elements", "action", "actions", "test", "stale", "recovery",
+    "identify", "appropriate", "selected", "result", "results", "observable", "outcome",
+    "playback", "playing", "media", "step", "task",
 }
 
 _URL_PATTERN = re.compile(
     r"https?://[a-zA-Z0-9.-]+(?::\d+)?(?:/[^\s]*)?|"
+    r"file:///[^\s\'\")<>]+|"
     r"(?:[a-zA-Z0-9-]+\.)+(?:com|org|net|edu|gov|io|ai|dev|co|uk|de|ca|jp|fr|in)(?:/[^\s]*)?",
     re.IGNORECASE,
 )
@@ -285,6 +288,11 @@ class SemanticVerifier:
                     w for w in re.findall(r"\w+", (task.objective or "").lower())
                     if w not in _STOP_WORDS and len(w) > 3
                 ]
+                if not title_tokens and getattr(task, "goal_text", None):
+                    title_tokens = [
+                        w for w in re.findall(r"\w+", (task.goal_text or "").lower())
+                        if w not in _STOP_WORDS and len(w) > 3
+                    ]
                 identity_matched = True
                 if title_tokens:
                     search_scope = f"{url.lower()} {title.lower()} {observation.page_text_summary.lower() if observation.page_text_summary else ''}"
@@ -385,6 +393,7 @@ class SemanticVerifier:
         graph: Any,
         session_id: str,
         evidence_items: Optional[List[Dict[str, Any]]] = None,
+        user_id: Optional[str] = None,
     ) -> GoalVerificationResult:
         """
         Evaluates whether all required tasks and objectives for a goal were verified.
@@ -401,24 +410,120 @@ class SemanticVerifier:
                 explanation="No tasks in orchestration graph.",
             )
 
+        expected_user_id = user_id or getattr(graph, "user_id", None)
+        expected_plan_hash = getattr(graph, "plan_hash", None)
+
+        def _is_valid_vault_evidence(ev: Any, expected_tid: Optional[str] = None) -> bool:
+            if not isinstance(ev, dict):
+                return False
+            # 1. Session binding check: reject missing or foreign session_id
+            ev_sid = ev.get("session_id")
+            if not ev_sid or ev_sid != session_id:
+                return False
+            # 2. Task binding check: must belong to a task in the graph (and expected_tid if specified)
+            ev_tid = ev.get("task_id")
+            if not ev_tid or ev_tid not in nodes:
+                return False
+            if expected_tid is not None and ev_tid != expected_tid:
+                return False
+            # 3. Tenant/User ownership check: reject foreign user evidence (AUD-S3-03: no system wildcard)
+            ev_uid = ev.get("user_id")
+            if expected_user_id and ev_uid and ev_uid != expected_user_id:
+                return False
+            if not expected_user_id and getattr(graph, "user_id", None) and ev_uid and ev_uid != getattr(graph, "user_id", None):
+                return False
+            # 4. Plan hash integrity check: reject stale or mismatched plan evidence
+            ev_meta = ev.get("metadata") if isinstance(ev.get("metadata"), dict) else {}
+            ev_ph = ev.get("plan_hash") or ev_meta.get("plan_hash")
+            if expected_plan_hash and expected_plan_hash not in ("", "unhashed"):
+                if ev_ph and ev_ph not in ("", "unhashed") and ev_ph != expected_plan_hash:
+                    return False
+            # 5. Verification status must be 'verified'
+            if str(ev.get("verification_status", "")).lower() != "verified":
+                return False
+            # 6. Strict cryptographic evidence integrity verification (AUD-S3-02)
+            from execution.evidence.evidence_vault import EvidenceVault
+            is_valid, reason = EvidenceVault.verify_record(ev)
+            if not is_valid:
+                logger.warning(
+                    f"[SemanticVerifier] Evidence record {ev.get('id')} failed cryptographic verification: {reason}"
+                )
+                return False
+            return True
+
         verified_count = 0
+        unverified_completed_count = 0
         failed_count = 0
-        inconclusive_count = 0
+        blocked_count = 0
+        pending_count = 0
+        ready_count = 0
         needs_review_count = 0
+        inconclusive_count = 0
         supporting_hashes: List[str] = []
 
         if evidence_items:
             for ev in evidence_items:
-                h = ev.get("artifact_hash")
-                if h and h not in supporting_hashes:
-                    supporting_hashes.append(h)
+                if _is_valid_vault_evidence(ev):
+                    h = ev.get("artifact_hash")
+                    if h and h not in supporting_hashes:
+                        supporting_hashes.append(h)
 
         for tid, node in nodes.items():
             status_val = node.status.value if hasattr(node.status, "value") else str(node.status)
+
+            # Strict evidence-based verification check:
+            # Task completion is NOT task verification. Verification requires empirical proof.
+            has_browser_verif = False
+            bres = getattr(node, "browser_result", None)
+            if bres and getattr(bres, "verification", None):
+                b_sid = getattr(bres, "session_id", None)
+                b_tid = getattr(bres, "task_id", None)
+                verif_obj = bres.verification
+                v_tid = getattr(verif_obj, "task_id", None)
+                v_stat = getattr(verif_obj, "status", None)
+                session_ok = (b_sid is None or b_sid == "" or b_sid == session_id)
+                task_ok = (b_tid is None or b_tid == tid) and (v_tid is None or v_tid == tid)
+                if session_ok and task_ok and (v_stat == BrowserVerificationStatus.VERIFIED or str(v_stat).lower() == "verified"):
+                    has_browser_verif = True
+
+            has_tool_verif = False
+            tres = getattr(node, "tool_result", None)
+            if tres and getattr(tres, "success", False) is True:
+                t_out = getattr(tres, "output_data", None)
+                if t_out is None and hasattr(tres, "data"):
+                    t_out = getattr(tres, "data", None)
+                if (
+                    (isinstance(t_out, dict) and len(t_out) > 0)
+                    or (t_out is not None and not isinstance(t_out, dict) and str(t_out).strip() != "")
+                    or bool(getattr(tres, "extracted_text", None))
+                    or bool(getattr(tres, "artifacts", None))
+                ):
+                    has_tool_verif = True
+
+            has_vault_evidence = False
+            if evidence_items:
+                for ev in evidence_items:
+                    if _is_valid_vault_evidence(ev, expected_tid=tid):
+                        has_vault_evidence = True
+                        break
+
+            is_empirically_verified = has_browser_verif or has_tool_verif or has_vault_evidence
+
             if status_val == "completed":
+                if is_empirically_verified:
+                    verified_count += 1
+                else:
+                    unverified_completed_count += 1
+            elif status_val == "verified":
                 verified_count += 1
-            elif status_val in ("failed", "blocked"):
+            elif status_val == "failed":
                 failed_count += 1
+            elif status_val == "blocked":
+                blocked_count += 1
+            elif status_val in ("waiting", "ready"):
+                ready_count += 1
+            elif status_val == "pending":
+                pending_count += 1
             elif status_val in ("outcome_unknown", "approval_needed"):
                 needs_review_count += 1
             else:
@@ -427,45 +532,77 @@ class SemanticVerifier:
         task_confidences: List[float] = []
         for tid, node in nodes.items():
             c_score = None
-            if getattr(node, "browser_result", None) and getattr(node.browser_result, "verification", None):
-                c_score = getattr(node.browser_result.verification, "confidence_score", None)
+            bres = getattr(node, "browser_result", None)
+            if bres and getattr(bres, "verification", None):
+                b_sid = getattr(bres, "session_id", None)
+                b_tid = getattr(bres, "task_id", None)
+                verif_obj = bres.verification
+                v_tid = getattr(verif_obj, "task_id", None)
+                session_ok = (b_sid is None or b_sid == "" or b_sid == session_id)
+                task_ok = (b_tid is None or b_tid == tid) and (v_tid is None or v_tid == tid)
+                if session_ok and task_ok and getattr(verif_obj, "status", None) == BrowserVerificationStatus.VERIFIED:
+                    c_score = getattr(verif_obj, "confidence_score", None)
+            elif getattr(node, "tool_result", None) is not None:
+                tres = node.tool_result
+                if getattr(tres, "success", False) is True:
+                    t_out = getattr(tres, "output_data", None)
+                    if t_out is None and hasattr(tres, "data"):
+                        t_out = getattr(tres, "data", None)
+                    if (
+                        (isinstance(t_out, dict) and len(t_out) > 0)
+                        or (t_out is not None and not isinstance(t_out, dict) and str(t_out).strip() != "")
+                        or bool(getattr(tres, "extracted_text", None))
+                        or bool(getattr(tres, "artifacts", None))
+                    ):
+                        c_score = 1.0
             if c_score is None and evidence_items:
                 for ev in evidence_items:
-                    if ev.get("task_id") == tid and ev.get("confidence_score") is not None:
-                        c_score = float(ev["confidence_score"])
-                        break
+                    if _is_valid_vault_evidence(ev, expected_tid=tid):
+                        if ev.get("confidence_score") is not None:
+                            c_score = float(ev["confidence_score"])
+                            break
             if c_score is not None:
                 task_confidences.append(float(c_score))
             else:
-                status_str = node.status.value if hasattr(node.status, "value") else str(node.status)
-                if status_str == "completed":
-                    task_confidences.append(0.70)
-                else:
-                    task_confidences.append(0.0)
+                # Missing evidence MUST yield 0.0 confidence (never assume 0.70 default)
+                task_confidences.append(0.0)
 
         # Honest weakest-link goal confidence:
         # In a required sequence, high confidence tasks cannot conceal a weak link
-        min_conf = min(task_confidences) if task_confidences else 0.50
-        mean_conf = (sum(task_confidences) / len(task_confidences)) if task_confidences else 0.50
+        min_conf = min(task_confidences) if task_confidences else 0.0
+        mean_conf = (sum(task_confidences) / len(task_confidences)) if task_confidences else 0.0
         weakest_link_conf = round(min(min_conf, mean_conf), 2)
 
-        if failed_count > 0:
+        if failed_count > 0 or blocked_count > 0:
             overall = "failed"
             conf = 0.0
-            explanation = f"Goal failed: {failed_count} task(s) failed or were blocked."
+            fail_parts = []
+            if failed_count > 0:
+                fail_parts.append(f"{failed_count} directly failed")
+            if blocked_count > 0:
+                fail_parts.append(f"{blocked_count} blocked")
+            if pending_count > 0:
+                fail_parts.append(f"{pending_count} pending")
+            if ready_count > 0:
+                fail_parts.append(f"{ready_count} ready")
+            explanation = f"Goal failed: {', '.join(fail_parts)} out of {total} task(s)."
         elif needs_review_count > 0:
             overall = "needs_human_review"
             conf = round(min(0.50, weakest_link_conf), 2)
             explanation = f"Goal requires operator review: {needs_review_count} task(s) in uncertain or approval state."
-        elif verified_count == total:
+        elif unverified_completed_count > 0:
+            overall = "unverified"
+            conf = 0.0
+            explanation = f"Goal unverified: {unverified_completed_count}/{total} completed task(s) lack empirical verification evidence."
+        elif verified_count == total and total > 0:
             overall = "verified"
             # Honest weakest-link confidence: bounded by the minimum confidence task
             conf = round(min(0.99, max(0.10, weakest_link_conf)), 2)
-            explanation = f"Goal fully verified: all {total} task(s) completed (weakest-link confidence: {conf * 100:.1f}% based on {len(task_confidences)} task scores)."
+            explanation = f"Goal fully verified: all {total} task(s) completed and verified (weakest-link confidence: {conf * 100:.1f}% based on {len(task_confidences)} task scores)."
         else:
             overall = "inconclusive"
             conf = round(min(0.50, max(0.0, weakest_link_conf * (verified_count / total))), 2)
-            explanation = f"Goal incomplete: {verified_count}/{total} tasks verified, {inconclusive_count} remaining."
+            explanation = f"Goal incomplete: {verified_count}/{total} tasks verified, {inconclusive_count + pending_count + ready_count} remaining."
 
         return GoalVerificationResult(
             session_id=session_id,
@@ -474,8 +611,12 @@ class SemanticVerifier:
             confidence_score=conf,
             total_tasks=total,
             verified_tasks=verified_count,
+            completed_unverified_tasks=unverified_completed_count,
             failed_tasks=failed_count,
-            inconclusive_tasks=inconclusive_count,
+            blocked_tasks=blocked_count,
+            pending_tasks=pending_count,
+            ready_tasks=ready_count,
+            inconclusive_tasks=inconclusive_count + pending_count + ready_count + needs_review_count,
             supporting_evidence_hashes=supporting_hashes,
             explanation=explanation,
         )
@@ -491,6 +632,13 @@ class SemanticVerifier:
         expected_url = getattr(task, "expected_url", None)
         if expected_url:
             targets.append(str(expected_url).strip())
+
+        meta = getattr(task, "metadata", None)
+        if isinstance(meta, dict):
+            for k in ("expected_url", "destination_url", "url"):
+                val = meta.get(k)
+                if val and str(val).strip() not in targets:
+                    targets.append(str(val).strip())
 
         text_sources = [task.objective or "", task.success_criteria or ""] + (task.constraints or [])
         combined = " ".join(text_sources)
@@ -511,15 +659,26 @@ class SemanticVerifier:
             return False, f"Expected URL matching {expected_urls}, but observed blank page '{observed_url}'."
 
         norm_observed = cls._normalize_url(observed_url)
-        observed_host = urllib.parse.urlparse(norm_observed).netloc.lower().lstrip("www.")
+        observed_parsed = urllib.parse.urlparse(norm_observed)
+        observed_host = observed_parsed.netloc.lower().lstrip("www.")
 
         for exp in expected_urls:
             if exp in ("about:blank", "blank"):
                 continue
             norm_expected = cls._normalize_url(exp)
-            expected_host = urllib.parse.urlparse(norm_expected).netloc.lower().lstrip("www.")
-            expected_path = urllib.parse.urlparse(norm_expected).path.rstrip("/")
-            observed_path = urllib.parse.urlparse(norm_observed).path.rstrip("/")
+            expected_parsed = urllib.parse.urlparse(norm_expected)
+
+            # Support local file:// fixture URL matching
+            if expected_parsed.scheme == "file" and observed_parsed.scheme == "file":
+                exp_file_path = urllib.parse.unquote(expected_parsed.path).rstrip("/").lower()
+                obs_file_path = urllib.parse.unquote(observed_parsed.path).rstrip("/").lower()
+                if exp_file_path and (exp_file_path == obs_file_path or exp_file_path in obs_file_path):
+                    return True, f"Observed local file path matches expected target '{norm_expected}'"
+                continue
+
+            expected_host = expected_parsed.netloc.lower().lstrip("www.")
+            expected_path = expected_parsed.path.rstrip("/")
+            observed_path = observed_parsed.path.rstrip("/")
 
             host_matches = expected_host and (expected_host == observed_host or expected_host in observed_host or observed_host in expected_host)
             if not host_matches:
@@ -645,8 +804,8 @@ class SemanticVerifier:
             return True
 
         # 2. 'play' as an action targeting media: e.g. 'play song', 'play video', 'play track', 'play audio', 'play music',
-        #    'play the', 'play it', or 'and play'
-        if re.search(r'\bplay\s+(?:the\s+)?(?:song|video|track|audio|music|episode|podcast|movie|clip|sound)\b', cleaned):
+        #    'play the', 'play it', 'play the selected result', or 'and play'
+        if re.search(r'\bplay\s+(?:the\s+)?(?:selected\s+)?(?:result|song|video|track|audio|music|episode|podcast|movie|clip|sound)\b', cleaned):
             return True
 
         if re.search(r'\b(?:and|then)\s+play\b', cleaned):
@@ -699,8 +858,9 @@ class SemanticVerifier:
         keywords = [w for w in words if w not in _STOP_WORDS]
 
         if not keywords:
-            # If no specific keywords, check non-blank page
-            if observed_url and observed_url not in ("", "about:blank"):
+            # If criteria had only generic task verbs (e.g. 'Identify the appropriate result'),
+            # require non-blank page with interactive elements or visible content
+            if observed_url and observed_url not in ("", "about:blank") and (page_text or observation.observed_elements):
                 return True, "General success criteria verified on active page."
             return False, "Unable to verify criteria on blank page."
 

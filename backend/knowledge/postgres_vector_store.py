@@ -180,6 +180,49 @@ class PostgresPgVectorStore(VectorStore):
         """Truthful indicator of whether Postgres/pgvector or local memory is serving vectors."""
         return "postgres_pgvector" if self._is_pg_connected else "local_fallback"
 
+    @staticmethod
+    def _is_chunk_retrievable(
+        meta: Dict[str, Any],
+        filter_metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """
+        Enforces quarantine, invalidation, expiration, and tenant isolation on knowledge chunks.
+        AUD-S3-05: Fails closed when user-scoped chunks are accessed without matching viewer identity.
+        """
+        status = str(meta.get("status") or meta.get("trust_status") or "active").strip().lower()
+        if status in ("quarantined", "invalidated", "expired", "rejected", "revoked", "deprecated"):
+            return False
+        if meta.get("quarantine_reason"):
+            return False
+
+        expires_at = meta.get("expires_at")
+        if expires_at is not None:
+            try:
+                if float(expires_at) <= time.time():
+                    return False
+            except (TypeError, ValueError):
+                pass
+
+        chunk_uid = str(meta.get("user_id") or "").strip()
+        viewer_uid = ""
+        if filter_metadata:
+            viewer_uid = str(filter_metadata.get("_viewer_user_id") or filter_metadata.get("user_id") or "").strip()
+
+        # If chunk is tenant-owned, it MUST only be visible to that specific user
+        if chunk_uid:
+            if not viewer_uid or chunk_uid != viewer_uid:
+                return False
+
+        # Apply other custom metadata filters if specified
+        if filter_metadata:
+            for k, v in filter_metadata.items():
+                if k in ("_viewer_user_id", "user_id"):
+                    continue
+                if str(meta.get(k)) != str(v):
+                    return False
+
+        return True
+
     def add_chunks(self, chunks: List[DocumentChunk]) -> int:
         """
         Embeds and stores document chunks into PostgreSQL / local store.
@@ -200,18 +243,29 @@ class PostgresPgVectorStore(VectorStore):
         # Compute embeddings for chunks that don't have them with atomic provenance
         chunks_needing_embed = [c for c in valid_chunks if not c.embedding]
         if chunks_needing_embed:
-            if hasattr(self.embedding_provider, "embed_texts_with_provenance"):
-                results = self.embedding_provider.embed_texts_with_provenance([c.content for c in chunks_needing_embed])
-                for c, res in zip(chunks_needing_embed, results):
-                    c.embedding = res.vector
-                    c.metadata.setdefault("embedding_provider", res.provider)
-                    c.metadata.setdefault("embedding_model", res.model)
-                    c.metadata.setdefault("embedding_dim", res.dimension)
-                    c.metadata.setdefault("embedding_space", res.embedding_space)
-            else:
-                computed_embeddings = self.embedding_provider.embed_texts([c.content for c in chunks_needing_embed])
-                for c, emb in zip(chunks_needing_embed, computed_embeddings):
-                    c.embedding = emb
+            try:
+                if hasattr(self.embedding_provider, "embed_texts_with_provenance"):
+                    results = self.embedding_provider.embed_texts_with_provenance([c.content for c in chunks_needing_embed])
+                    for c, res in zip(chunks_needing_embed, results):
+                        c.embedding = res.vector
+                        c.metadata.setdefault("embedding_provider", res.provider)
+                        c.metadata.setdefault("embedding_model", res.model)
+                        c.metadata.setdefault("embedding_dim", res.dimension)
+                        c.metadata.setdefault("embedding_space", res.embedding_space)
+                else:
+                    computed_embeddings = self.embedding_provider.embed_texts([c.content for c in chunks_needing_embed])
+                    for c, emb in zip(chunks_needing_embed, computed_embeddings):
+                        c.embedding = emb
+            except Exception as emb_err:
+                logger.warning(f"[PostgresPgVectorStore] Embedding failure during add_chunks: {emb_err}. Recording chunks without vectors.")
+                for c in chunks_needing_embed:
+                    c.embedding = []
+                    c.metadata["embedding_stored"] = False
+                    c.metadata["embedding_error"] = str(emb_err)
+                    c.metadata["embedding_provider"] = "error"
+                    c.metadata["embedding_model"] = "none"
+                    c.metadata["embedding_dim"] = 0
+                    c.metadata["embedding_space"] = "none:none:0"
 
         # Record fallback provenance metadata if not already populated
         provider_name = getattr(self.embedding_provider, "active_provider", "unknown")
@@ -357,11 +411,27 @@ class PostgresPgVectorStore(VectorStore):
                     where_clauses: List[str] = [
                         "embedding IS NOT NULL",
                         "metadata->>'embedding_space' = %s",
+                        "COALESCE(metadata->>'status', metadata->>'trust_status', 'active') NOT IN ('quarantined', 'invalidated', 'expired', 'rejected', 'revoked', 'deprecated')",
+                        "metadata->>'quarantine_reason' IS NULL",
+                        "(metadata->>'expires_at' IS NULL OR (metadata->>'expires_at')::double precision > %s)",
                     ]
-                    filter_params: List[Any] = [query_space]
+                    filter_params: List[Any] = [query_space, time.time()]
+
+                    # AUD-S3-04 & AUD-S3-05: User ownership pre-filtering before LIMIT
+                    viewer_uid = ""
+                    if filter_metadata:
+                        viewer_uid = str(filter_metadata.get("_viewer_user_id") or filter_metadata.get("user_id") or "").strip()
+
+                    if viewer_uid:
+                        where_clauses.append("(metadata->>'user_id' IS NULL OR metadata->>'user_id' = %s)")
+                        filter_params.append(viewer_uid)
+                    else:
+                        where_clauses.append("metadata->>'user_id' IS NULL")
 
                     if filter_metadata:
                         for k, v in filter_metadata.items():
+                            if k in ("_viewer_user_id", "user_id"):
+                                continue
                             where_clauses.append("metadata->>%s = %s")
                             filter_params.extend([k, str(v)])
 
@@ -380,7 +450,7 @@ class PostgresPgVectorStore(VectorStore):
                         ORDER BY embedding <=> %s ASC
                         LIMIT %s
                     """
-                    full_params = [query_vector, query_vector] + filter_params + [query_vector, top_k * 2]
+                    full_params = [query_vector, query_vector] + filter_params + [query_vector, max(top_k * 3, 10)]
 
                     cur.execute(sql, full_params)
                     rows = cur.fetchall()
@@ -389,6 +459,8 @@ class PostgresPgVectorStore(VectorStore):
                     for row in rows:
                         chunk_id, doc_id, src, content, meta_json, score, dist = row
                         meta = meta_json if isinstance(meta_json, dict) else json.loads(meta_json or "{}")
+                        if not self._is_chunk_retrievable(meta, filter_metadata):
+                            continue
                         relevance = max(0.0, min(1.0, float(score)))
 
                         if relevance < min_score:
@@ -425,15 +497,9 @@ class PostgresPgVectorStore(VectorStore):
             if not emb or len(emb) != vec_dim:
                 continue
 
-            # Check metadata filter
-            if filter_metadata:
-                match = True
-                for k, v in filter_metadata.items():
-                    if str(chunk.metadata.get(k)) != str(v):
-                        match = False
-                        break
-                if not match:
-                    continue
+            # Check quarantine, expiration, and metadata/tenant filter
+            if not self._is_chunk_retrievable(chunk.metadata, filter_metadata):
+                continue
 
             # Compute cosine similarity
             sim = self._cosine_similarity(query_vec, emb)
@@ -475,11 +541,29 @@ class PostgresPgVectorStore(VectorStore):
             try:
                 tsv_expr = "tsv_content" if getattr(self, "_has_tsv_column", False) else "to_tsvector('english', content)"
                 with self._pg_conn.cursor() as cur:
-                    where_clauses: List[str] = [f"{tsv_expr} @@ plainto_tsquery('english', %s)"]
-                    filter_params: List[Any] = [query_text]
+                    where_clauses: List[str] = [
+                        f"{tsv_expr} @@ plainto_tsquery('english', %s)",
+                        "COALESCE(metadata->>'status', metadata->>'trust_status', 'active') NOT IN ('quarantined', 'invalidated', 'expired', 'rejected', 'revoked', 'deprecated')",
+                        "metadata->>'quarantine_reason' IS NULL",
+                        "(metadata->>'expires_at' IS NULL OR (metadata->>'expires_at')::double precision > %s)",
+                    ]
+                    filter_params: List[Any] = [query_text, time.time()]
+
+                    # AUD-S3-04 & AUD-S3-05: User ownership pre-filtering before LIMIT
+                    viewer_uid = ""
+                    if filter_metadata:
+                        viewer_uid = str(filter_metadata.get("_viewer_user_id") or filter_metadata.get("user_id") or "").strip()
+
+                    if viewer_uid:
+                        where_clauses.append("(metadata->>'user_id' IS NULL OR metadata->>'user_id' = %s)")
+                        filter_params.append(viewer_uid)
+                    else:
+                        where_clauses.append("metadata->>'user_id' IS NULL")
 
                     if filter_metadata:
                         for k, v in filter_metadata.items():
+                            if k in ("_viewer_user_id", "user_id"):
+                                continue
                             where_clauses.append("metadata->>%s = %s")
                             filter_params.extend([k, str(v)])
 
@@ -497,7 +581,7 @@ class PostgresPgVectorStore(VectorStore):
                         ORDER BY text_rank DESC
                         LIMIT %s
                     """
-                    full_params = [query_text] + filter_params + [top_k]
+                    full_params = [query_text] + filter_params + [max(top_k * 3, 10)]
                     cur.execute(sql, full_params)
                     rows = cur.fetchall()
 
@@ -505,6 +589,8 @@ class PostgresPgVectorStore(VectorStore):
                     for row in rows:
                         chunk_id, doc_id, src, content, meta_json, rank = row
                         meta = meta_json if isinstance(meta_json, dict) else json.loads(meta_json or "{}")
+                        if not self._is_chunk_retrievable(meta, filter_metadata):
+                            continue
                         results.append(
                             RetrievedChunk(
                                 chunk_id=chunk_id,
@@ -517,7 +603,7 @@ class PostgresPgVectorStore(VectorStore):
                                 metadata=meta,
                             )
                         )
-                    return results
+                    return results[:top_k]
             except Exception as e:
                 err_str = str(e).lower()
                 if "undefined_column" in err_str or "tsv_content" in err_str:
@@ -537,15 +623,9 @@ class PostgresPgVectorStore(VectorStore):
 
         scored_chunks = []
         for chunk_id, chunk in self._local_chunks.items():
-            # Check metadata filter
-            if filter_metadata:
-                match = True
-                for k, v in filter_metadata.items():
-                    if str(chunk.metadata.get(k)) != str(v):
-                        match = False
-                        break
-                if not match:
-                    continue
+            # Check quarantine, expiration, and metadata/tenant filter
+            if not self._is_chunk_retrievable(chunk.metadata, filter_metadata):
+                continue
 
             content_lower = chunk.content.lower()
             score = 0.0

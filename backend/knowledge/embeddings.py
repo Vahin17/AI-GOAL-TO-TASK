@@ -222,6 +222,7 @@ class HybridEmbeddingService(EmbeddingProvider):
 
     _openai_quota_exhausted: bool = False
     _auth_invalid: bool = False
+    _failed_api_key: Optional[str] = None
     _last_failure_time: float = 0.0
     _last_failure_type: Optional[str] = None
     _consecutive_failures: int = 0
@@ -243,6 +244,19 @@ class HybridEmbeddingService(EmbeddingProvider):
                 api_key = os.getenv("OPENAI_API_KEY")
 
         self._api_key = api_key
+
+        # If a new, different API key is supplied, clear prior key-specific 401 lock
+        if (
+            self._api_key
+            and HybridEmbeddingService._auth_invalid
+            and HybridEmbeddingService._failed_api_key is not None
+            and self._api_key != HybridEmbeddingService._failed_api_key
+        ):
+            HybridEmbeddingService._auth_invalid = False
+            HybridEmbeddingService._failed_api_key = None
+            if HybridEmbeddingService._last_failure_type == "auth_401":
+                HybridEmbeddingService._last_failure_type = None
+                HybridEmbeddingService._last_fallback_reason = None
 
         if (
             self._api_key
@@ -273,6 +287,7 @@ class HybridEmbeddingService(EmbeddingProvider):
         """Resets all class-level failure and recovery tracking (useful for test isolation)."""
         cls._openai_quota_exhausted = False
         cls._auth_invalid = False
+        cls._failed_api_key = None
         cls._last_failure_time = 0.0
         cls._last_failure_type = None
         cls._consecutive_failures = 0
@@ -398,6 +413,7 @@ class HybridEmbeddingService(EmbeddingProvider):
 
         if failure_type == "auth_401":
             HybridEmbeddingService._auth_invalid = True
+            HybridEmbeddingService._failed_api_key = self._api_key
             HybridEmbeddingService._last_failure_type = "auth_401"
             HybridEmbeddingService._last_fallback_reason = "auth_invalid_401"
             logger.warning(f"[EMBEDDING-FALLBACK] reason=auth_invalid_401: {e}")
@@ -561,9 +577,11 @@ class HybridEmbeddingService(EmbeddingProvider):
     @property
     def active_provider(self) -> str:
         """Truthful indicator of which embedding provider is actively generating vectors."""
+        if self._force_local:
+            return "local_deterministic_fallback"
         if self._openai and not HybridEmbeddingService._openai_quota_exhausted and not self._is_in_cooldown():
             return "openai"
-        if HybridEmbeddingService._auth_invalid:
+        if HybridEmbeddingService._auth_invalid and self._api_key:
             return "local_deterministic_fallback (auth_invalid_401)"
         if HybridEmbeddingService._openai_quota_exhausted:
             return "local_deterministic_fallback (openai_quota_exhausted)"

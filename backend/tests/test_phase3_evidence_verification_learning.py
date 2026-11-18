@@ -426,6 +426,26 @@ def test_verified_execution_produces_candidate_playbook_with_redacted_steps():
         goal_text="Download monthly report",
         graph=graph,
         goal_verification=verified_goal_res,
+        evidence_records=[
+            {
+                "id": "ev_s9_1",
+                "session_id": "sess_verif",
+                "user_id": "user_pb_2",
+                "task_id": "step_1",
+                "verification_status": "verified",
+                "artifact_hash": hashlib.sha256(b"Step 1 verified execution trace").hexdigest(),
+                "content_payload": "Step 1 verified execution trace",
+            },
+            {
+                "id": "ev_s9_2",
+                "session_id": "sess_verif",
+                "user_id": "user_pb_2",
+                "task_id": "step_2",
+                "verification_status": "verified",
+                "artifact_hash": hashlib.sha256(b"Step 2 verified execution trace").hexdigest(),
+                "content_payload": "Step 2 verified execution trace",
+            },
+        ],
         category="finance_reporting",
     )
 

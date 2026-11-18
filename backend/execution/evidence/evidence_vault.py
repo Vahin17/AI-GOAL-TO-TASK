@@ -26,6 +26,9 @@ logger = logging.getLogger(__name__)
 # Fallback in-memory store for unit tests or offline dev
 _MEMORY_EVIDENCE_STORE: Dict[str, List[Dict[str, Any]]] = {}
 
+# In-memory artifact store for binary evidence payloads (keyed by evidence id and artifact hash)
+_BINARY_ARTIFACT_STORE: Dict[str, bytes] = {}
+
 
 @dataclass
 class EvidenceRecord:
@@ -94,17 +97,33 @@ class EvidenceVault:
 
         # 1. Privacy redaction on content & metadata
         redacted_content: Optional[str] = None
-        if raw_content is not None:
+        has_non_empty_content = (
+            raw_content is not None
+            and (
+                (isinstance(raw_content, bytes) and len(raw_content) > 0)
+                or (not isinstance(raw_content, bytes) and len(str(raw_content).strip()) > 0)
+            )
+        )
+        if not has_non_empty_content and str(verification_status).lower() == "verified":
+            logger.warning(
+                f"[EvidenceVault] Rejecting 'verified' status for task {task_id} in session {session_id}: "
+                "empty or missing raw_content cannot produce verified evidence."
+            )
+            verification_status = "unverified"
+            confidence_score = 0.0
+
+        if has_non_empty_content:
             if isinstance(raw_content, bytes):
                 # For byte payloads, compute hash directly
                 artifact_hash = cls.compute_artifact_hash(raw_content)
                 redacted_content = "[BINARY_PAYLOAD_HASHED]"
+                _BINARY_ARTIFACT_STORE[ev_id] = raw_content
             else:
                 clean_text = PrivacyRedactor.redact_text(str(raw_content))
                 artifact_hash = cls.compute_artifact_hash(clean_text)
                 redacted_content = clean_text
         else:
-            artifact_hash = cls.compute_artifact_hash(f"{task_id}:{now}:{verification_status}")
+            artifact_hash = "unverified" if str(verification_status).lower() == "unverified" else cls.compute_artifact_hash(f"{task_id}:{now}:{verification_status}")
 
         clean_metadata = PrivacyRedactor.redact_dict(metadata or {})
         clean_metadata["plan_hash"] = plan_hash
@@ -180,14 +199,104 @@ class EvidenceVault:
         if not recorded_hash:
             return False, f"Evidence record {rec_id} has no artifact_hash to verify."
 
+        h_str = str(recorded_hash).strip()
+        if len(h_str) != 64 or not all(c in "0123456789abcdefABCDEF" for c in h_str):
+            msg = f"Evidence record {rec_id} artifact_hash '{h_str}' is not a valid 64-character hexadecimal SHA-256 digest."
+            logger.critical(f"[EvidenceVault] {msg}")
+            return False, msg
+
         computed_hash = cls.compute_artifact_hash(actual_content)
-        if computed_hash != recorded_hash:
+        if computed_hash.lower() != h_str.lower():
             msg = (
-                f"Evidence integrity violation for {rec_id}: recorded hash {recorded_hash[:12]}... "
+                f"Evidence integrity violation for {rec_id}: recorded hash {h_str[:12]}... "
                 f"does not match actual content hash {computed_hash[:12]}..."
             )
             logger.critical(f"[EvidenceVault] {msg}")
             return False, msg
+        return True, "Cryptographic hash verified successfully."
+
+    @classmethod
+    def verify_record(
+        cls,
+        record: Union[EvidenceRecord, Dict[str, Any]],
+        actual_content: Optional[Union[str, bytes]] = None,
+    ) -> Tuple[bool, str]:
+        """
+        Independently verifies the cryptographic integrity and provenance of an evidence record.
+        Strictly enforces:
+        1. Exact 64-character hexadecimal SHA-256 digest (no prefixes, no truncated hashes).
+        2. Non-empty payload or referenced artifact on disk / in vault.
+        3. Placeholder sentinels (e.g. [BINARY_PAYLOAD_HASHED]) fail closed unless
+           the authoritative vault or artifact path independently resolves and verifies the artifact.
+        4. Cryptographic hash recomputation matching recorded artifact_hash.
+        """
+        if not record:
+            return False, "Evidence record is missing or null."
+
+        rec_dict = record.to_dict() if hasattr(record, "to_dict") else dict(record)
+        rec_id = rec_dict.get("id", "unknown")
+
+        # 1. Authoritative 64-hex SHA-256 format check
+        h = str(rec_dict.get("artifact_hash") or "").strip()
+        if not h or h.lower() == "unverified":
+            return False, f"Evidence record {rec_id} has unverified or empty artifact_hash."
+        if len(h) != 64 or not all(c in "0123456789abcdefABCDEF" for c in h):
+            msg = f"Evidence record {rec_id} artifact_hash '{h}' is not a valid 64-character hexadecimal SHA-256 digest."
+            logger.critical(f"[EvidenceVault] {msg}")
+            return False, msg
+
+        # 2. Resolve canonical content to verify
+        content_to_verify: Optional[Union[str, bytes]] = actual_content
+
+        # Direct in-record content
+        if content_to_verify is None:
+            if rec_dict.get("raw_content") is not None:
+                content_to_verify = rec_dict.get("raw_content")
+            elif rec_dict.get("content_bytes") is not None:
+                content_to_verify = rec_dict.get("content_bytes")
+
+        # Stored-by-reference file artifact lookup (checked before vault cache if explicitly referenced)
+        meta = rec_dict.get("metadata") if isinstance(rec_dict.get("metadata"), dict) else {}
+        ref_path = meta.get("artifact_path") or meta.get("file_path") or meta.get("storage_path")
+        if content_to_verify is None and ref_path:
+            import os
+            if os.path.isfile(ref_path):
+                try:
+                    with open(ref_path, "rb") as f:
+                        content_to_verify = f.read()
+                except Exception as read_err:
+                    return False, f"Evidence record {rec_id} referenced artifact '{ref_path}' could not be read: {read_err}"
+            else:
+                return False, f"Evidence record {rec_id} referenced artifact '{ref_path}' does not exist on disk."
+
+        # Vault binary artifact store lookup
+        if content_to_verify is None and rec_id in _BINARY_ARTIFACT_STORE:
+            content_to_verify = _BINARY_ARTIFACT_STORE[rec_id]
+
+        # Redacted text content payload
+        payload = rec_dict.get("content_payload")
+        if content_to_verify is None:
+            if payload is not None:
+                payload_str = str(payload).strip()
+                # Fail closed on placeholder sentinels when no underlying binary artifact could be resolved
+                if payload_str in ("[BINARY_PAYLOAD_HASHED]", "[REDACTED]", "PLACEHOLDER", "unverified"):
+                    return False, f"Evidence record {rec_id} content_payload is placeholder sentinel '{payload_str}' without verifiable underlying artifact."
+                if len(payload_str) > 0:
+                    content_to_verify = payload
+
+        if content_to_verify is None or (isinstance(content_to_verify, (str, bytes)) and len(content_to_verify) == 0):
+            return False, f"Evidence record {rec_id} has no verifiable payload or referenced artifact."
+
+        # 3. Cryptographic hash recomputation
+        computed_hash = cls.compute_artifact_hash(content_to_verify)
+        if computed_hash.lower() != h.lower():
+            msg = (
+                f"Evidence integrity violation for {rec_id}: recorded hash {h[:12]}... "
+                f"does not match actual content hash {computed_hash[:12]}..."
+            )
+            logger.critical(f"[EvidenceVault] {msg}")
+            return False, msg
+
         return True, "Cryptographic hash verified successfully."
 
     @classmethod

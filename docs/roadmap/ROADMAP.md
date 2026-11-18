@@ -186,6 +186,79 @@ flowchart TD
 - **Scope:** Formal owner approval gate for Phase 3 security hardening and remediation (Tasks T7, T7.1, T7.1.1, T7.1.2, T7.1.3).
 - **Status:** `done` (APPROVED by Project Owner)
 
+---
+
+### CRITICAL REMEDIATION TRACK — FALSE-SUCCESS ELIMINATION (P0)
+
+#### Stage 0: Project Preservation & Working-Tree Inventory
+- **Scope:** Exhaustive inventory of 34 modified tracked files, 10 untracked Python test files, and roadmap documentation. Zero file changes.
+- **Deliverable:** `docs/roadmap/evidence/ARDO_STAGE0_PROJECT_PRESERVATION_REPORT.md`
+- **Status:** `done`
+
+#### Stage 0B: Verified Project Checkpoint
+- **Scope:** Clean, granular Git commit consolidating all verified M1, M2, M3 work prior to remediation.
+- **Commit:** `bdaa78ef7c00a104d3a30089a6614e117fda291f`
+- **Status:** `done`
+
+#### Stage 1A: False-Success Remediation Specification & Architecture Alignment
+- **Scope:** Complete engineering design for eliminating generic task simulation, decoupling task completion from verification, enforcing weakest-link goal confidence, preventing unverified playbook/memory pollution, transaction-safe quarantine of 4 contaminated database records, and designing offline Chromium acceptance tests on a local fixture. Read-only design.
+- **Deliverable:** `docs/roadmap/evidence/ARDO_STAGE1A_FALSE_SUCCESS_REMEDIATION_SPEC.md`
+- **Status:** `done`
+
+#### Stage 1B: False-Success Remediation Implementation
+- **Scope:** Implement Stage 1A specification:
+  1. Remove all simulated execution and enforce fail-closed behavior on unbound tasks.
+  2. Implement `CalculationTool` AST-safe mathematical evaluator in `backend/execution/registry/`.
+  3. Decouple completion from verification in `SemanticVerifier.verify_goal_outcome`.
+  4. Quarantined 4 contaminated PostgreSQL records (`pb_f8b7ab912370`, `pb_3ed0edabd366`, `mem_859b0e4920a5`, `mem_651c95e43ab8`) with backup in `quarantine_backup_records.json`.
+  5. Updated fallback rules to decompose media goals into 5 discrete browser tasks and set `is_fallback: True`.
+  6. Added truthful frontend telemetry and fallback status banner in `ExecutionControl.tsx`.
+  7. Created `mock_youtube.html` local fixture and verified genuine offline Chromium execution with real Playwright.
+  8. Verified 14/14 regression scenarios in `test_false_success_remediation.py` and 2/2 offline acceptance tests in `test_offline_chromium_acceptance.py`.
+- **Deliverable:** `docs/roadmap/evidence/ARDO_STAGE1B_FALSE_SUCCESS_REMEDIATION_REPORT.md`
+- **Status:** `done`
+
+#### Stage 1C: Independent False-Success Remediation Verification
+- **Scope:** Strict read-only forensic verification of Stage 1B implementation, identifying 8 targeted follow-up items (`DEF-1C-01` through `DEF-1C-08`) with verdict `PASS WITH CONDITIONS — READY AFTER SPECIFIED CORRECTIONS`.
+- **Deliverable:** `docs/roadmap/evidence/ARDO_STAGE1C_INDEPENDENT_VERIFICATION_REPORT.md`
+- **Status:** `done`
+
+#### Stage 1D: Targeted False-Success Remediation Corrections & Bounded Verification
+- **Scope:** Resolve `DEF-1C-01` through `DEF-1C-08` (fallback plan memory/playbook guard, strict evidence session/task/tenant/plan-hash binding, frontend truthfulness, quarantine filter enforcement on explicit status/ID queries, word-boundary browser classification, legacy test contract alignment, `ToolResult.output_data` persistence & empty-output rejection, and full-pipeline offline Chromium orchestration acceptance) plus resolve `_BrowserSession._op_lock` non-reentrant self-deadlock on `INSPECT_PAGE` via `_inspect_page_unlocked()`.
+- **Deliverable:** `docs/roadmap/evidence/ARDO_STAGE1D_TARGETED_CORRECTIONS_REPORT.md`
+- **Exit Gate:** All 8 defects and `_op_lock` deadlock resolved; `test_15_8_registry_dispatch` (1/1 passed in 15.84s), selected Phase 15 perception subset (7/7 passed, 5 deselected in 35.43s), `test_false_success_remediation.py` (19/19 passed in 7.13s), `test_offline_chromium_acceptance.py` (4/4 passed), and focused regression suites passing with zero hangs.
+- **Status:** `done`
+
+#### Stage 1E: Independent Verification of Stage 1D Corrections
+- **Scope:** Strict read-only independent code and bounded test verification of all Stage 1D corrections (`DEF-1C-01`..`DEF-1C-08`), the `_BrowserSession._op_lock` deadlock fix, and individual forensic assessment of the 5 deselected Phase 15 perception tests.
+- **Deliverable:** `docs/roadmap/evidence/ARDO_STAGE1E_INDEPENDENT_VERIFICATION_REPORT.md`
+- **Exit Gate:** Verdict **`PASS`** issued; 162/162 backend tests passed in combined Stage 1E run (1 skipped live DB test), 7/7 selected Phase 15 perception tests passed (5 deselected legacy `ActionSynthesizer` tests accounted for), frontend `npx tsc --noEmit` passed (0 errors).
+- **Status:** `done`
+
+#### Stage 2: Fix Goal Decomposition and Fallback Transparency
+- **Scope:** Ensure reliable goal decomposition, structured primary planner failure classification (`provider_timeout`, `provider_quota_exhausted`, `provider_rate_limited`, `provider_auth_error`, `provider_unavailable`, `empty_response`, `malformed_output`, `validation_rejected`), ambiguity/clarification HTTP 422 propagation, deduplicated & parallel/calculation-aware fallback planning, strict DAG structural validation (rejecting duplicate node IDs, dangling edges, and cycles), end-to-end provenance propagation (`DAGBuilder`, `/plan`, `/orchestrate`, `/orchestrate/{id}/state`, checkpoints, and frontend `ChatPanel`/`ExecutionControl`), and preservation of all Stage 1 false-success guarantees.
+- **Deliverable:** `docs/roadmap/evidence/ARDO_STAGE2_GOAL_DECOMPOSITION_FALLBACK_REPORT.md`
+- **Exit Gate:** All 31 Stage 2 scenarios verified (`58/58 passed` in Stage 2 planning/fallback suite, `161/161 passed` + `1 skipped` in Stage 1/security/recovery regression suite, `npx tsc --noEmit` 0 errors).
+- **Status:** `done`
+
+#### Stage 3: Protect Memory, Playbooks and RAG
+- **Scope:** End-to-end protection and verification of semantic memory, playbook promotion, and RAG grounding against unverified or contaminated inputs (`DEF-S3-01` through `DEF-S3-05`): fail-closed tenant isolation on playbook lookup/status updates, evidence-backed semantic memory eligibility/lifecycle/deduplication/supersession/expiration/CRUD, playbook candidate step-status & evidence provenance validation, tenant-scoped RAG document ingestion & retrieval with prompt-injection delimiter neutralization, and per-key `HybridEmbeddingService` 401 failure scoping.
+- **Deliverable:** `docs/roadmap/evidence/ARDO_STAGE3_MEMORY_PLAYBOOKS_RAG_REPORT.md`
+- **Exit Gate:** All 52 Stage 3 behavioral scenarios verified (`52/52 passed` in `test_stage3_memory_playbooks_rag.py`, `119/119 passed` + `1 skipped` across all 8 Stage 3 + RAG/memory/playbook suites, and `130/130 passed` + `1 skipped` across Stage 1, Stage 2, and M3 security regression suites).
+- **Status:** `done`
+
+#### Stage 4: Correct Dashboard Execution Reporting
+- **Scope:** End-to-end verification and refinement of dashboard execution reporting across all states.
+- **Status:** `todo` (Awaiting Project Owner Authorization)
+
+#### Stage 5: Run Comprehensive Regression Tests
+- **Scope:** Full-system regression verification across all stages.
+- **Status:** `todo` (Awaiting Project Owner Authorization)
+
+---
+
+### PHASE 3 — PRODUCTION PREPARATION (CONTINUED)
+
 #### Task T8: Live Acceptance Trials
 - **Scope:** Requires explicit owner approval and valid Gemini credentials/quota. Run real live browser and API acceptance trials.
 - **Status:** `todo`

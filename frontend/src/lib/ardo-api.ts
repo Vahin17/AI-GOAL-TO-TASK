@@ -34,6 +34,11 @@ export interface ARDONodeState {
   approval_needed: boolean;
   execution_logs: string[];
   starvation_counter: number;
+  verification_status?: string;
+  is_verified?: boolean;
+  artifact_hash?: string | null;
+  failure_reason?: string | null;
+  is_ready?: boolean;
 }
 
 export interface ARDOSessionResponse {
@@ -44,6 +49,14 @@ export interface ARDOSessionResponse {
   initial_queue: string[];
   initial_graph: ARDONodeState[];
   plan_hash?: string;
+  is_fallback?: boolean;
+  fallback_reason?: string;
+  planning_mode?: 'primary_ai' | 'deterministic_fallback';
+  provider_used?: string | null;
+  primary_failure_code?: string | null;
+  validation_passed?: boolean;
+  limitations?: string[];
+  requires_clarification?: boolean;
 }
 
 export interface OrchestrationEvent {
@@ -68,15 +81,30 @@ export interface ARDOStateResponse {
   stability_events: StabilityEvent[];
   weight_suggestion?: WeightSuggestion;
   plan_hash?: string;
+  is_fallback?: boolean;
+  fallback_reason?: string;
+  planning_mode?: 'primary_ai' | 'deterministic_fallback';
+  provider_used?: string | null;
+  primary_failure_code?: string | null;
+  validation_passed?: boolean;
+  limitations?: string[];
+  goal_verification?: GoalVerificationResponse;
 }
 
 export interface SessionMetrics {
   session_id: string;
   elapsed_seconds: number;
   tasks_total: number;
+  tasks_pending?: number;
+  tasks_ready?: number;
+  tasks_running?: number;
+  tasks_approval_required?: number;
+  tasks_paused?: number;
   tasks_completed: number;
+  tasks_verified?: number;
   tasks_failed: number;
   tasks_blocked: number;
+  tasks_cancelled?: number;
   tasks_retried: number;
   total_retry_count: number;
   recovery_count?: number;
@@ -85,11 +113,13 @@ export interface SessionMetrics {
   throughput_per_minute: number;
   avg_latency_seconds: number;
   success_rate: number;
+  execution_progress_pct?: number;
+  verification_progress_pct?: number;
   timeline_markers: TimelineMarker[];
 }
 
 export interface TimelineMarker {
-  type: 'start' | 'complete' | 'fail' | 'retry' | 'reschedule' | 'approve';
+  type: 'start' | 'complete' | 'verified' | 'fail' | 'retry' | 'reschedule' | 'approve' | 'pause' | 'cancel';
   task_id: string;
   task_name: string;
   timestamp: number;
@@ -189,11 +219,15 @@ export interface BrowserEvidenceItem {
 export interface GoalVerificationResponse {
   session_id: string;
   goal_text: string;
-  overall_status: 'verified' | 'failed' | 'inconclusive' | 'needs_human_review';
+  overall_status: 'verified' | 'failed' | 'inconclusive' | 'needs_human_review' | 'unverified';
   confidence_score: number;
   total_tasks: number;
   verified_tasks: number;
+  completed_unverified_tasks?: number;
   failed_tasks: number;
+  blocked_tasks?: number;
+  pending_tasks?: number;
+  ready_tasks?: number;
   inconclusive_tasks: number;
   supporting_evidence_hashes: string[];
   explanation: string;
@@ -215,6 +249,8 @@ export interface PlaybookItem {
   created_at: number;
   updated_at: number;
   plan_hash?: string;
+  is_fallback?: boolean;
+  fallback_reason?: string;
 }
 
 export interface SessionEvidenceResponse {
@@ -349,6 +385,8 @@ export const ardoApi = {
       task_id: string;
       session_id?: string;
       plan_hash?: string;
+  is_fallback?: boolean;
+  fallback_reason?: string;
       approval_id?: string;
       expires_at?: string;
     }>(`/orchestrate/${sessionId}/approve/${taskId}`, {
@@ -367,6 +405,13 @@ export const ardoApi = {
       remaining_tasks: number;
       total_tasks: number;
     }>(`/orchestrate/${sessionId}/resume`, { method: 'POST' }),
+
+  /** Safely cancel an active orchestration session */
+  cancelSession: (sessionId: string) =>
+    request<{
+      session_id: string;
+      status: string;
+    }>(`/orchestrate/${sessionId}/cancel`, { method: 'POST' }),
 
   /** Get scheduling explanation for a specific task */
   getExplanation: (sessionId: string, taskId: string) =>

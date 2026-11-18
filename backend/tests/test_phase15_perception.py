@@ -46,10 +46,14 @@ from main import app
 
 @pytest.fixture
 def dashboard_fixture_url():
-    """File URL pointing to deterministic local dashboard fixture."""
+    """File URL pointing to deterministic local dashboard fixture, permitted via NetworkGuard test origin."""
+    from execution.browser.network_guard import NetworkGuard
     fixture_path = Path(__file__).parent / "fixtures" / "internal_dashboard.html"
     assert fixture_path.exists(), f"Fixture not found at {fixture_path}"
-    return fixture_path.resolve().as_uri()
+    url = fixture_path.resolve().as_uri()
+    NetworkGuard.register_test_allowed_origin(url)
+    yield url
+    NetworkGuard.unregister_test_allowed_origin(url)
 
 
 @pytest.fixture(autouse=True)
@@ -379,13 +383,13 @@ async def test_15_9_legacy_browser_action_compatibility(dashboard_fixture_url):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 10. Generic Simulation Fallback
+# 10. Generic Simulation Forbidden (Fails Closed)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_15_10_generic_simulation_fallback():
     """
-    Test 10: Tasks that have no tool grounding cleanly fall back to simulation.
+    Test 10: Tasks that have no tool grounding or executor fail closed truthfully (simulation forbidden).
     """
     nodes_data = [
         {"id": "t_generic", "data": {"label": "Analyze architectural invariants"}},
@@ -405,7 +409,8 @@ async def test_15_10_generic_simulation_fallback():
     async for _ in engine.run():
         pass
 
-    assert node.status in (TaskState.COMPLETED, TaskState.FAILED)
+    assert node.status == TaskState.FAILED
+    assert any("Simulated completion forbidden" in log for log in node.execution_logs)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -488,8 +493,12 @@ async def test_15_11_end_to_end_natural_language_workflow(dashboard_fixture_url)
 @pytest.mark.asyncio
 async def test_15_12_inspect_endpoint(dashboard_fixture_url):
     """
-    Test 12: GET /orchestrate/{session_id}/inspect returns live PageSnapshot.
+    Test 12: GET /orchestrate/{session_id}/inspect returns live PageSnapshot
+    for an authenticated owner of the active session.
     """
+    from orchestration.scheduler import ARDOScheduler, ARDOSession
+    from orchestration.dag_builder import ARDOGraph
+
     async with PlaywrightBrowserExecutor(headless=True) as executor:
         b_tool = BrowserTool(executor=executor)
         registry = ToolRegistry.get_instance()
@@ -500,9 +509,21 @@ async def test_15_12_inspect_endpoint(dashboard_fixture_url):
             BrowserAction(action_type=BrowserActionType.NAVIGATE, url=dashboard_fixture_url)
         )
 
-        from api.router import inspect_session_page
-        data = await inspect_session_page("sess_test_p15")
-        assert data["status"] == "active"
-        assert "snapshot" in data
-        assert "elements" in data["snapshot"]
-        assert len(data["snapshot"]["elements"]) >= 4
+        sess = ARDOSession(
+            session_id="sess_test_p15",
+            graph=ARDOGraph(session_id="sess_test_p15", user_id="user_p15"),
+            mode="safe",
+            user_id="user_p15",
+        )
+        sess.engine.browser_adapter = b_tool.adapter
+        sess.engine.tool_registry = registry
+        ARDOScheduler._sessions["sess_test_p15"] = sess
+        try:
+            from api.router import inspect_session_page
+            data = await inspect_session_page("sess_test_p15", current_user={"id": "user_p15"})
+            assert data["status"] == "active"
+            assert "snapshot" in data
+            assert "elements" in data["snapshot"]
+            assert len(data["snapshot"]["elements"]) >= 4
+        finally:
+            ARDOScheduler._sessions.pop("sess_test_p15", None)

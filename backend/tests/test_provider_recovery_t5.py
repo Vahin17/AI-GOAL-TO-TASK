@@ -319,13 +319,49 @@ def test_semantic_memory_does_not_persist_incomplete_run_as_success():
 
 
 def test_semantic_memory_records_success_only_when_all_tasks_and_goal_verified():
-    """Only a run where all tasks completed and goal was verified produces a 'success' memory."""
-    node1 = ARDOTaskNode(task_id="t1", task_name="Step 1", status=TaskState.COMPLETED)
-    node2 = ARDOTaskNode(task_id="t2", task_name="Step 2", status=TaskState.COMPLETED)
+    """Only a run where all tasks completed and goal was verified with genuine evidence produces a 'success' memory."""
+    from execution.registry.tool_models import ToolResult
+
+    # 1. Completed nodes WITHOUT empirical evidence must record 'unverified', NOT 'success'
+    unverif_n1 = ARDOTaskNode(task_id="t1", task_name="Step 1", status=TaskState.COMPLETED)
+    unverif_n2 = ARDOTaskNode(task_id="t2", task_name="Step 2", status=TaskState.COMPLETED)
+    graph_unverif = ARDOGraph(nodes={"t1": unverif_n1, "t2": unverif_n2}, session_id="s_mem_unverif")
+    engine_unverif = RuntimeEngine(graph=graph_unverif, session_id="s_mem_unverif")
+
+    mock_rag_unverif = MagicMock()
+    with patch("knowledge.rag_service.RAGService.get_instance", return_value=mock_rag_unverif):
+        engine_unverif._persist_semantic_memory()
+        assert mock_rag_unverif.record_plan_outcome.called
+        assert mock_rag_unverif.record_plan_outcome.call_args[1]["outcome_status"] == "unverified"
+
+    # 2. Completed nodes WITH legitimate empirical tool results record 'success'
+    node1 = ARDOTaskNode(
+        task_id="t1",
+        task_name="Step 1",
+        status=TaskState.COMPLETED,
+        tool_result=ToolResult(
+            call_id="c1",
+            tool_name="calculator",
+            action_name="evaluate",
+            success=True,
+            output_data={"result": 42.0, "expression": "6 * 7"},
+        ),
+    )
+    node2 = ARDOTaskNode(
+        task_id="t2",
+        task_name="Step 2",
+        status=TaskState.COMPLETED,
+        tool_result=ToolResult(
+            call_id="c2",
+            tool_name="calculator",
+            action_name="evaluate",
+            success=True,
+            output_data={"result": 84.0, "expression": "42 * 2"},
+        ),
+    )
     graph = ARDOGraph(nodes={"t1": node1, "t2": node2}, session_id="s_mem_test2")
 
     engine = RuntimeEngine(graph=graph, session_id="s_mem_test2")
-    engine._goal_verification = MagicMock(overall_status="verified")
 
     mock_rag = MagicMock()
     with patch("knowledge.rag_service.RAGService.get_instance", return_value=mock_rag):

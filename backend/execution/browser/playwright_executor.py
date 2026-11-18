@@ -269,13 +269,19 @@ class _BrowserSession:
     def is_running(self) -> bool:
         return self._is_started
 
+    async def _inspect_page_unlocked(self, max_elements: int = 50) -> Any:
+        """Internal page inspection helper. Assumes caller already holds self._op_lock."""
+        if not self._op_lock.locked():
+            raise RuntimeError("_inspect_page_unlocked called without holding _op_lock")
+        if not self.is_running:
+            await self.start()
+        from execution.browser.environment_perception import EnvironmentPerceptionEngine
+        engine = EnvironmentPerceptionEngine(max_elements=max_elements)
+        return await engine.inspect(self._page)
+
     async def inspect_page(self, max_elements: int = 50) -> Any:
         async with self._op_lock:
-            if not self.is_running:
-                await self.start()
-            from execution.browser.environment_perception import EnvironmentPerceptionEngine
-            engine = EnvironmentPerceptionEngine(max_elements=max_elements)
-            return await engine.inspect(self._page)
+            return await self._inspect_page_unlocked(max_elements=max_elements)
 
     async def execute_action(self, action: BrowserAction) -> BrowserActionResult:
         async with self._op_lock:
@@ -606,7 +612,7 @@ class _BrowserSession:
                 )
 
             elif action.action_type == BrowserActionType.INSPECT_PAGE:
-                snapshot = await self.inspect_page()
+                snapshot = await self._inspect_page_unlocked()
                 duration = (time.perf_counter() - t_start) * 1000.0
                 return BrowserActionResult(
                     success=True,

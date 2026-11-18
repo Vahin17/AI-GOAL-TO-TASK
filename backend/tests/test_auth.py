@@ -420,7 +420,7 @@ def test_websocket_authenticated_ticket_and_cross_user_rejection(client):
     ticket_owner = ws_ticket_manager.issue_ticket(user_id=user_a["id"], session_id=session_id)
 
     # Mock event generator
-    async def mock_events(sid):
+    async def mock_events(sid, user_id=None, **kwargs):
         yield {"event_type": "heartbeat", "session_id": sid}
         yield {"event_type": "session_complete", "session_id": sid}
 

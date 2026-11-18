@@ -51,6 +51,12 @@ class MockDecisionProvider:
 
 def test_browser_agent_cold_start_initializes_page():
     """Bug 1 Fix: BrowserAgent.run() starts the browser adapter/executor if cold, avoiding page=None."""
+    import pathlib
+    from execution.browser.network_guard import NetworkGuard
+    fixture_path = pathlib.Path(__file__).parent / "fixtures" / "mock_youtube.html"
+    local_url = fixture_path.resolve().as_uri()
+    NetworkGuard.register_test_allowed_origin(local_url)
+
     async def _test():
         executor = PlaywrightBrowserExecutor(headless=True)
         adapter = BrowserTaskAdapter(executor=executor)
@@ -58,11 +64,11 @@ def test_browser_agent_cold_start_initializes_page():
         assert not executor.is_running
 
         llm = MockDecisionProvider([
-            {"decision": "execute", "reason": "Nav", "action": {"action_type": "navigate", "url": "https://example.com"}},
+            {"decision": "execute", "reason": "Nav", "action": {"action_type": "navigate", "url": local_url}},
             {"decision": "finish", "reason": "Done"},
         ])
         agent = BrowserAgent(llm_provider=llm, adapter=adapter)
-        task = BrowserTask(task_id="cold_start_task", objective="Open example.com", session_id="sess_cold")
+        task = BrowserTask(task_id="cold_start_task", objective="Open test fixture", session_id="sess_cold")
 
         try:
             res = await agent.run(task)
@@ -71,17 +77,24 @@ def test_browser_agent_cold_start_initializes_page():
             assert adapter.get_page() is not None
         finally:
             await executor.stop()
+            NetworkGuard.unregister_test_allowed_origin(local_url)
 
     asyncio.run(_test())
 
 
 def test_browser_task_via_runtime_engine_cold_start():
     """Bug 1 Fix: RuntimeEngine executing a browser task from cold ARDOSession initializes browser without page=None."""
+    import pathlib
+    from execution.browser.network_guard import NetworkGuard
+    fixture_path = pathlib.Path(__file__).parent / "fixtures" / "mock_youtube.html"
+    local_url = fixture_path.resolve().as_uri()
+    NetworkGuard.register_test_allowed_origin(local_url)
+
     async def _test():
-        graph = ARDOGraph()
+        graph = ARDOGraph(session_id="sess_rt_cold", user_id="user_cold")
         node = ARDOTaskNode(
             task_id="b_task_1",
-            task_name="Navigate to https://example.com",
+            task_name=f"Navigate to {local_url}",
             dependency_ids=[],
         )
         graph.nodes[node.task_id] = node
@@ -94,10 +107,11 @@ def test_browser_task_via_runtime_engine_cold_start():
             session_id="sess_rt_cold",
             mode="sequential",
             browser_adapter=adapter,
+            user_id="user_cold",
         )
 
         llm = MockDecisionProvider([
-            {"decision": "execute", "reason": "Nav", "action": {"action_type": "navigate", "url": "https://example.com"}},
+            {"decision": "execute", "reason": "Nav", "action": {"action_type": "navigate", "url": local_url}},
             {"decision": "finish", "reason": "Done"},
         ])
         agent = BrowserAgent(llm_provider=llm, adapter=adapter)
@@ -113,6 +127,7 @@ def test_browser_task_via_runtime_engine_cold_start():
             assert node.browser_result.outcome == BrowserAgentOutcome.COMPLETED
         finally:
             await engine.cleanup()
+            NetworkGuard.unregister_test_allowed_origin(local_url)
 
     asyncio.run(_test())
 
@@ -131,18 +146,21 @@ def test_approval_approve_resumes_and_completes_task(monkeypatch):
     )
 
     async def _test():
-        graph = ARDOGraph()
+        from execution.registry.tool_models import ToolCall
+        graph = ARDOGraph(session_id="sess_approve_resume", user_id=user["id"], goal_text="Approve Goal")
         node_gated = ARDOTaskNode(
             task_id="gated_task",
             task_name="Approve-required task",
             dependency_ids=[],
             approval_needed=True,
             risk_score=0.9,
+            tool_call=ToolCall(call_id="call_gated", tool_name="calculator", action_name="evaluate", arguments={"expression": "10 + 10"})
         )
         node_dep = ARDOTaskNode(
             task_id="dep_task",
             task_name="Dependent task",
             dependency_ids=["gated_task"],
+            tool_call=ToolCall(call_id="call_dep", tool_name="calculator", action_name="evaluate", arguments={"expression": "20 + 20"})
         )
         for n in [node_gated, node_dep]:
             graph.nodes[n.task_id] = n
@@ -150,7 +168,13 @@ def test_approval_approve_resumes_and_completes_task(monkeypatch):
             graph.reverse_adj[n.task_id] = list(n.dependency_ids)
         graph.adjacency["gated_task"] = ["dep_task"]
 
-        engine = RuntimeEngine(graph=graph, session_id="sess_approve_resume", mode="sequential")
+        engine = RuntimeEngine(
+            graph=graph,
+            session_id="sess_approve_resume",
+            mode="sequential",
+            user_id=user["id"],
+            goal_id="Approve Goal"
+        )
 
         events = []
         approved = False
@@ -161,7 +185,7 @@ def test_approval_approve_resumes_and_completes_task(monkeypatch):
             auth_db.record_plan_approval(
                 session_id="sess_approve_resume",
                 user_id=user["id"],
-                plan_hash=graph.recompute_plan_hash(engine.goal_id),
+                plan_hash=graph.recompute_plan_hash("Approve Goal"),
                 task_id="gated_task",
                 status="approved",
             )
@@ -305,11 +329,13 @@ def test_browser_agent_result_and_task_node_serialization():
 def test_persistence_failure_does_not_alter_task_outcome():
     """Bug 3 Fix: A database persistence failure logs an error but does not fail or alter task execution."""
     async def _test():
-        graph = ARDOGraph()
+        from execution.registry.tool_models import ToolCall
+        graph = ARDOGraph(session_id="sess_persist_fail", user_id="user_test")
         node = ARDOTaskNode(
             task_id="task_persist_fail",
             task_name="Standard task",
             dependency_ids=[],
+            tool_call=ToolCall(call_id="call_persist", tool_name="calculator", action_name="evaluate", arguments={"expression": "1 + 1"}),
         )
         graph.nodes[node.task_id] = node
 
@@ -324,6 +350,7 @@ def test_persistence_failure_does_not_alter_task_outcome():
             session_id="sess_persist_fail",
             mode="sequential",
             db=mock_db,
+            user_id="user_test",
         )
 
         events = []
