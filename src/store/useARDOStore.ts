@@ -36,12 +36,16 @@ import {
 export type ARDONodeStatus =
   | 'pending'
   | 'waiting'
+  | 'ready'
   | 'active'
   | 'retrying'
   | 'completed'
+  | 'verified'
   | 'failed'
   | 'blocked'
-  | 'approval_needed';
+  | 'approval_needed'
+  | 'paused'
+  | 'cancelled';
 
 // ── Store State ────────────────────────────────────────────────────────────
 
@@ -53,6 +57,11 @@ interface ARDOState {
   isSessionActive: boolean;
   wsStatus: 'idle' | 'connecting' | 'connected' | 'disconnected' | 'error';
   planHash: string | null;
+  isFallbackPlan: boolean;
+  fallbackReason: string | null;
+  planningMode: 'primary_ai' | 'deterministic_fallback';
+  primaryFailureCode: string | null;
+  planningLimitations: string[];
 
   // Graph
   nodeMap: Map<string, ARDONodeState>;
@@ -99,6 +108,7 @@ interface ARDOState {
   applyEvent: (event: OrchestrationEvent) => void;
   approveTask: (taskId: string, planHash?: string, notes?: string) => Promise<void>;
   rejectTask: (taskId: string) => Promise<void>;
+  cancelSession: () => Promise<void>;
   resetOrchestration: () => void;
   refreshState: () => Promise<void>;
   refreshMetrics: () => Promise<void>;
@@ -114,16 +124,26 @@ const DEFAULT_METRICS: SessionMetrics = {
   session_id: '',
   elapsed_seconds: 0,
   tasks_total: 0,
+  tasks_pending: 0,
+  tasks_ready: 0,
+  tasks_running: 0,
+  tasks_approval_required: 0,
+  tasks_paused: 0,
   tasks_completed: 0,
+  tasks_verified: 0,
   tasks_failed: 0,
   tasks_blocked: 0,
+  tasks_cancelled: 0,
   tasks_retried: 0,
   total_retry_count: 0,
+  recovery_count: 0,
   reschedule_count: 0,
   approval_count: 0,
   throughput_per_minute: 0,
   avg_latency_seconds: 0,
   success_rate: 0,
+  execution_progress_pct: 0,
+  verification_progress_pct: 0,
   timeline_markers: [],
 };
 
@@ -140,6 +160,11 @@ export const useARDOStore = create<ARDOState>((set, get) => ({
   isSessionActive: false,
   wsStatus: 'idle',
   planHash: null,
+  isFallbackPlan: false,
+  fallbackReason: null,
+  planningMode: 'primary_ai',
+  primaryFailureCode: null,
+  planningLimitations: [],
 
   nodeMap: new Map(),
   executionQueue: [],
@@ -180,7 +205,23 @@ export const useARDOStore = create<ARDOState>((set, get) => ({
       return;
     }
     console.log('[RUN-GUARD] startSession called', request);
-    set({ isLoading: true, error: null, wsStatus: 'connecting', currentGoal: request.goal, browserEvidence: [] });
+    set({
+      isLoading: true,
+      error: null,
+      wsStatus: 'connecting',
+      currentGoal: request.goal,
+      browserEvidence: [],
+      goalVerification: null,
+      isFallbackPlan: false,
+      fallbackReason: null,
+      planningMode: 'primary_ai',
+      primaryFailureCode: null,
+      planningLimitations: [],
+      executionEvents: [],
+      timelineMarkers: [],
+      rescheduleLog: [],
+      stabilityEvents: [],
+    });
     try {
       const response: ARDOSessionResponse = await ardoApi.startOrchestration(request);
 
@@ -195,6 +236,11 @@ export const useARDOStore = create<ARDOState>((set, get) => ({
         mode: response.mode,
         isSessionActive: true,
         planHash: response.plan_hash ?? null,
+        isFallbackPlan: Boolean(response.is_fallback),
+        fallbackReason: response.fallback_reason ?? null,
+        planningMode: response.planning_mode ?? (response.is_fallback ? 'deterministic_fallback' : 'primary_ai'),
+        primaryFailureCode: response.primary_failure_code ?? null,
+        planningLimitations: response.limitations ?? [],
         nodeMap,
         executionQueue: response.initial_queue,
         parallelGroups: response.parallel_groups,
@@ -207,7 +253,10 @@ export const useARDOStore = create<ARDOState>((set, get) => ({
       _wsClient = new ARDOWebSocket({
         sessionId: response.session_id,
         onEvent: (event) => get().applyEvent(event),
-        onConnect: () => set({ wsStatus: 'connected' }),
+        onConnect: () => {
+          set({ wsStatus: 'connected' });
+          get().refreshState();
+        },
         onDisconnect: () => set({ wsStatus: 'disconnected' }),
         onError: () => set({ wsStatus: 'error' }),
       });
@@ -245,54 +294,80 @@ export const useARDOStore = create<ARDOState>((set, get) => ({
       const taskId = event.task_id;
       const node = taskId ? nodeMap.get(taskId) : undefined;
 
+      const isTerminalStatus = (st: string) =>
+        ['completed', 'verified', 'failed', 'blocked', 'cancelled'].includes(st);
+
       switch (event.event_type) {
         case 'task_started':
-          if (node) {
+          if (node && !isTerminalStatus(node.status)) {
             nodeMap.set(taskId!, { ...node, status: 'active' });
           }
           activeTaskId = taskId ?? null;
           retryingTaskIds.delete(taskId ?? '');
           break;
 
-        case 'task_completed':
+        case 'task_completed': {
+          const isVer = Boolean(
+            event.status === 'verified' ||
+            event.details?.is_verified === true ||
+            event.details?.verification_status === 'verified'
+          );
+          const newStatus: ARDONodeStatus = isVer ? 'verified' : 'completed';
+          const artHash = (event.details?.artifact_hash as string) || node?.artifact_hash;
           if (node) {
-            nodeMap.set(taskId!, { ...node, status: 'completed' });
+            nodeMap.set(taskId!, {
+              ...node,
+              status: newStatus,
+              is_verified: isVer,
+              verification_status: isVer ? 'verified' : 'unverified',
+              artifact_hash: artHash,
+            });
           }
           if (activeTaskId === taskId) activeTaskId = null;
-          // Deterministic idempotent count from nodeMap
-          const completedCount = Array.from(nodeMap.values()).filter(n => n.status === 'completed').length;
-          metrics = {
-            ...metrics,
-            tasks_completed: completedCount,
-          };
           timelineMarkers.push({
-            type: 'complete',
+            type: isVer ? 'verified' : 'complete',
             task_id: taskId!,
             task_name: event.task_name ?? '',
             timestamp: event.timestamp,
             latency: (event.details?.latency_seconds as number) ?? 0,
           });
           break;
+        }
 
-        case 'task_failed':
+        case 'task_verified':
+        case 'verification_completed': {
+          const isVer = (event.status || '').toLowerCase() === 'verified' || event.details?.is_verified === true;
+          if (node && isVer) {
+            const artHash = (event.details?.artifact_hash as string) || node.artifact_hash;
+            nodeMap.set(taskId!, {
+              ...node,
+              status: 'verified',
+              is_verified: true,
+              verification_status: 'verified',
+              artifact_hash: artHash,
+            });
+          }
+          break;
+        }
+
+        case 'task_failed': {
+          const reason = (event.details?.reason as string) || (event.details?.error as string) || node?.failure_reason || undefined;
           if (node) {
-            nodeMap.set(taskId!, { ...node, status: 'failed' });
+            nodeMap.set(taskId!, { ...node, status: 'failed', failure_reason: reason });
           }
           if (activeTaskId === taskId) activeTaskId = null;
-          metrics = {
-            ...metrics,
-            tasks_failed: (metrics.tasks_failed ?? 0) + 1,
-          };
           timelineMarkers.push({
             type: 'fail',
             task_id: taskId!,
             task_name: event.task_name ?? '',
             timestamp: event.timestamp,
+            reason: reason || undefined,
           });
           break;
+        }
 
         case 'task_retrying':
-          if (node) {
+          if (node && !isTerminalStatus(node.status)) {
             nodeMap.set(taskId!, {
               ...node,
               status: 'retrying',
@@ -300,10 +375,6 @@ export const useARDOStore = create<ARDOState>((set, get) => ({
             });
           }
           retryingTaskIds.add(taskId ?? '');
-          metrics = {
-            ...metrics,
-            total_retry_count: (metrics.total_retry_count ?? 0) + 1,
-          };
           timelineMarkers.push({
             type: 'retry',
             task_id: taskId!,
@@ -314,25 +385,37 @@ export const useARDOStore = create<ARDOState>((set, get) => ({
           });
           break;
 
-        case 'task_blocked':
+        case 'task_blocked': {
+          const cause = (event.details?.cause as string) || node?.failure_reason;
           if (node) {
-            nodeMap.set(taskId!, { ...node, status: 'blocked' });
+            nodeMap.set(taskId!, { ...node, status: 'blocked', failure_reason: cause });
           }
           blockedNodeIds.add(taskId ?? '');
           approvalPendingIds.delete(taskId ?? '');
           if (taskId) deniedTaskIds.add(taskId);
-          metrics = {
-            ...metrics,
-            tasks_blocked: (metrics.tasks_blocked ?? 0) + 1,
-          };
+          break;
+        }
+
+        case 'task_paused':
+          if (taskId && node && !isTerminalStatus(node.status)) {
+            nodeMap.set(taskId, { ...node, status: 'paused' });
+          }
           break;
 
+        case 'task_cancelled': {
+          const cancelReason = (event.details?.reason as string) || 'Cancelled';
+          if (taskId && node) {
+            nodeMap.set(taskId, { ...node, status: 'cancelled', failure_reason: cancelReason });
+          }
+          if (activeTaskId === taskId) activeTaskId = null;
+          break;
+        }
+
         case 'task_approval_needed':
-          if (node) {
+          if (node && !isTerminalStatus(node.status)) {
             nodeMap.set(taskId!, { ...node, status: 'approval_needed' });
           }
           approvalPendingIds.add(taskId ?? '');
-          // Phase 5: Capture safety metadata for the approval panel
           if (taskId && event.details) {
             const safetyMeta = event.details.safety_metadata as Record<string, unknown> | undefined;
             if (safetyMeta) {
@@ -341,10 +424,6 @@ export const useARDOStore = create<ARDOState>((set, get) => ({
               set({ safetyMetadataMap: updated });
             }
           }
-          metrics = {
-            ...metrics,
-            approval_count: (metrics.approval_count ?? 0) + 1,
-          };
           break;
 
         case 'task_approved':
@@ -362,14 +441,12 @@ export const useARDOStore = create<ARDOState>((set, get) => ({
           break;
 
         case 'dependents_waiting': {
-          // Update explanation / why-now
           const explanation = event.details?.explanation as WhyNowContext | undefined;
           if (explanation) whyNow = explanation;
-          // Update waiting tasks
           const waitingIds = (event.details?.newly_waiting as string[]) ?? [];
           for (const wid of waitingIds) {
             const wnode = nodeMap.get(wid);
-            if (wnode) nodeMap.set(wid, { ...wnode, status: 'waiting' });
+            if (wnode && !isTerminalStatus(wnode.status)) nodeMap.set(wid, { ...wnode, status: 'waiting' });
           }
           break;
         }
@@ -388,10 +465,6 @@ export const useARDOStore = create<ARDOState>((set, get) => ({
               timestamp: event.timestamp,
             },
           ].slice(-50);
-          metrics = {
-            ...metrics,
-            reschedule_count: (metrics.reschedule_count ?? 0) + 1,
-          };
           timelineMarkers.push({
             type: 'reschedule',
             task_id: taskId ?? '',
@@ -408,7 +481,6 @@ export const useARDOStore = create<ARDOState>((set, get) => ({
           if (event.details) {
             metrics = { ...metrics, ...(event.details as Partial<SessionMetrics>) };
           }
-          // Cleanly close WebSocket once session completes
           _wsClient?.disconnect();
           setTimeout(() => {
             const sid = get().sessionId;
@@ -419,6 +491,49 @@ export const useARDOStore = create<ARDOState>((set, get) => ({
           }, 50);
           break;
       }
+
+      // Idempotently compute all metrics directly from nodeMap (guarantees zero drift and zero double-counting)
+      const allNodes = Array.from(nodeMap.values());
+      const totalPlanned = allNodes.length;
+      const pendingCount = allNodes.filter(n => n.status === 'pending').length;
+      const readyCount = allNodes.filter(n => n.status === 'waiting' || n.status === 'ready').length;
+      const runningCount = allNodes.filter(n => n.status === 'active' || n.status === 'retrying').length;
+      const approvalCount = allNodes.filter(n => n.status === 'approval_needed').length;
+      const pausedCount = allNodes.filter(n => n.status === 'paused').length;
+      const verifiedCount = allNodes.filter(n => n.status === 'verified' || n.verification_status === 'verified').length;
+      const completedCount = allNodes.filter(n => n.status === 'completed' && n.verification_status !== 'verified').length;
+      const failedCount = allNodes.filter(n => n.status === 'failed').length;
+      const blockedCount = allNodes.filter(n => n.status === 'blocked').length;
+      const cancelledCount = allNodes.filter(n => n.status === 'cancelled').length;
+
+      const finishedCount = verifiedCount + completedCount + failedCount + blockedCount + cancelledCount;
+      const execProgress = totalPlanned > 0 ? Math.min(100, Number(((finishedCount / totalPlanned) * 100).toFixed(1))) : 0;
+      const verifProgress = totalPlanned > 0 ? Math.min(100, Number(((verifiedCount / totalPlanned) * 100).toFixed(1))) : 0;
+      const successRatio = totalPlanned > 0 ? (
+        (failedCount + blockedCount + cancelledCount) > 0
+          ? Number(((verifiedCount > 0 ? verifiedCount : (completedCount + verifiedCount)) / totalPlanned).toFixed(3))
+          : (completedCount + verifiedCount) < totalPlanned
+            ? Math.min(Number(((verifiedCount > 0 ? verifiedCount : (completedCount + verifiedCount)) / totalPlanned).toFixed(3)), 0.99)
+            : Number(((verifiedCount > 0 ? verifiedCount : (completedCount + verifiedCount)) / totalPlanned).toFixed(3))
+      ) : 0;
+
+      metrics = {
+        ...metrics,
+        tasks_total: totalPlanned,
+        tasks_pending: pendingCount,
+        tasks_ready: readyCount,
+        tasks_running: runningCount,
+        tasks_approval_required: approvalCount,
+        tasks_paused: pausedCount,
+        tasks_completed: completedCount,
+        tasks_verified: verifiedCount,
+        tasks_failed: failedCount,
+        tasks_blocked: blockedCount,
+        tasks_cancelled: cancelledCount,
+        execution_progress_pct: execProgress,
+        verification_progress_pct: verifProgress,
+        success_rate: successRatio,
+      };
 
       return {
         executionEvents,
@@ -478,6 +593,17 @@ export const useARDOStore = create<ARDOState>((set, get) => ({
     }
   },
 
+  cancelSession: async () => {
+    const { sessionId } = get();
+    if (!sessionId) return;
+    try {
+      await ardoApi.cancelSession(sessionId);
+      await get().refreshState();
+    } catch (err) {
+      set({ error: String(err) });
+    }
+  },
+
   // ── refreshState ──────────────────────────────────────────────────────
 
   refreshState: async () => {
@@ -499,6 +625,11 @@ export const useARDOStore = create<ARDOState>((set, get) => ({
         weightSuggestion: state.weight_suggestion ?? null,
         metrics: state.metrics as SessionMetrics,
         planHash: state.plan_hash ?? get().planHash,
+        isFallbackPlan: state.is_fallback !== undefined ? Boolean(state.is_fallback) : get().isFallbackPlan,
+        fallbackReason: state.fallback_reason !== undefined ? (state.fallback_reason ?? null) : get().fallbackReason,
+        planningMode: state.planning_mode ?? get().planningMode,
+        primaryFailureCode: state.primary_failure_code !== undefined ? (state.primary_failure_code ?? null) : get().primaryFailureCode,
+        planningLimitations: state.limitations ?? get().planningLimitations,
       });
     } catch {
       // Silent fail — WS events keep state fresh
@@ -536,7 +667,8 @@ export const useARDOStore = create<ARDOState>((set, get) => ({
     try {
       console.log('[RUN-GUARD] history/evidence refresh - loadEvidence', sid);
       const res = await ardoApi.getEvidence(sid);
-      if (res && res.evidence_items) {
+      const currentSid = get().sessionId;
+      if (res && res.evidence_items && (!currentSid || currentSid === sid)) {
         set({ browserEvidence: res.evidence_items });
       }
       get().loadGoalVerification(sid);
@@ -550,7 +682,8 @@ export const useARDOStore = create<ARDOState>((set, get) => ({
     if (!sid) return;
     try {
       const res = await ardoApi.getGoalVerification(sid);
-      if (res) {
+      const currentSid = get().sessionId;
+      if (res && (!currentSid || (res.session_id === sid && currentSid === sid))) {
         set({ goalVerification: res });
       }
     } catch {
@@ -579,6 +712,11 @@ export const useARDOStore = create<ARDOState>((set, get) => ({
       currentGoal: null,
       mode: 'safe',
       isSessionActive: false,
+      isFallbackPlan: false,
+      fallbackReason: null,
+      planningMode: 'primary_ai',
+      primaryFailureCode: null,
+      planningLimitations: [],
       wsStatus: 'idle',
       nodeMap: new Map(),
       executionQueue: [],

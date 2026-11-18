@@ -18,6 +18,7 @@ import {
   HelpCircle,
   Clock,
   AlertCircle,
+  AlertTriangle,
   BookOpen,
   Globe,
   Database,
@@ -55,11 +56,17 @@ export default function ExecutionControl() {
     planHash,
     approveTask,
     rejectTask,
+    cancelSession,
     resetOrchestration,
     loadHistory,
     loadEvidence,
     loadKnowledgeStats,
-    metrics
+    metrics,
+    isFallbackPlan,
+    fallbackReason,
+    planningMode,
+    primaryFailureCode,
+    planningLimitations
   } = useARDOStore();
   
   const [activeTab, setActiveTab] = useState<'main' | 'evidence' | 'rag_memory' | 'history' | 'dashboard' | 'timeline' | 'explainability'>('main');
@@ -78,20 +85,54 @@ export default function ExecutionControl() {
   }, [sessionId, metrics?.tasks_completed, loadEvidence]);
 
   let status = 'idle';
-  if (goalVerification) {
-    if (goalVerification.overall_status === 'verified') status = 'verified';
-    else if (goalVerification.overall_status === 'failed') status = 'failed';
-    else if (goalVerification.overall_status === 'needs_human_review') status = 'needs review';
-    else if (goalVerification.overall_status === 'inconclusive') status = 'inconclusive';
-    else status = goalVerification.overall_status;
+  const hasGenuineEvidence = Boolean(
+    browserEvidence &&
+    browserEvidence.length > 0 &&
+    browserEvidence.some(
+      (ev) =>
+        ev.verification_status === 'verified' &&
+        Boolean(ev.artifact_hash) &&
+        ev.artifact_hash !== 'unverified'
+    )
+  );
+  const activeGoalVerif =
+    goalVerification && (!sessionId || goalVerification.session_id === sessionId)
+      ? goalVerification
+      : null;
+
+  if (activeGoalVerif) {
+    if (activeGoalVerif.overall_status === 'verified') {
+      status = hasGenuineEvidence ? 'verified' : 'completed (unverified)';
+    } else if (activeGoalVerif.overall_status === 'unverified') {
+      status = 'completed (unverified)';
+    } else if (activeGoalVerif.overall_status === 'failed') {
+      status = 'failed';
+    } else if (activeGoalVerif.overall_status === 'needs_human_review') {
+      status = 'needs review';
+    } else if (activeGoalVerif.overall_status === 'inconclusive') {
+      status = 'inconclusive';
+    } else {
+      status = activeGoalVerif.overall_status;
+    }
   } else if (isSessionActive) {
-    if (approvalPendingIds.size > 0) status = 'planning';
-    else if (metrics && metrics.tasks_completed === metrics.tasks_total && metrics.tasks_total > 0) status = 'completed';
+    if (approvalPendingIds.size > 0) status = 'waiting for approval';
+    else if ((metrics?.tasks_paused ?? 0) > 0) status = 'paused';
+    else if ((metrics?.tasks_cancelled ?? 0) > 0) status = 'cancelled';
     else status = 'executing';
   } else if (metrics && metrics.tasks_total > 0) {
-    if (metrics.tasks_failed > 0) status = 'failed';
-    else if (metrics.tasks_blocked > 0) status = 'blocked';
-    else if (metrics.tasks_completed === metrics.tasks_total) status = 'completed';
+    if ((metrics.tasks_cancelled ?? 0) > 0 && (metrics.tasks_cancelled ?? 0) === metrics.tasks_total) {
+      status = 'cancelled';
+    } else if (metrics.tasks_failed > 0) {
+      status = 'failed';
+    } else if (metrics.tasks_blocked > 0) {
+      status = 'blocked';
+    } else if ((metrics.tasks_completed + (metrics.tasks_verified ?? 0)) === metrics.tasks_total) {
+      status = ((metrics.tasks_verified ?? 0) === metrics.tasks_total && hasGenuineEvidence)
+        ? 'verified'
+        : 'completed (unverified)';
+    } else if ((metrics.tasks_cancelled ?? 0) > 0) {
+      status = 'cancelled';
+    }
   }
 
   const ardoLogs = (executionEvents || [])
@@ -119,11 +160,23 @@ export default function ExecutionControl() {
              <Activity className="h-4 w-4 text-[#11999E]" />
              <h2 className="text-xs font-bold text-foreground uppercase tracking-wider">Console & Telemetry</h2>
           </div>
-          <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-lg bg-teal-50 border border-teal-200">
-             <ShieldCheck className="h-3 w-3 text-teal-700" />
-             <span className="text-[9px] font-bold text-teal-700 uppercase tracking-widest">
-               {sessionId ? sessionId.substring(0, 12) : 'STANDBY'}
-             </span>
+          <div className="flex items-center gap-2">
+            {isSessionActive && (
+              <button
+                type="button"
+                onClick={() => cancelSession()}
+                className="px-2 py-0.5 rounded text-[9px] font-bold uppercase tracking-wider bg-rose-50 text-rose-700 border border-rose-200 hover:bg-rose-100 transition-colors"
+                title="Safely cancel active execution"
+              >
+                Cancel
+              </button>
+            )}
+            <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-lg bg-teal-50 border border-teal-200">
+               <ShieldCheck className="h-3 w-3 text-teal-700" />
+               <span className="text-[9px] font-bold text-teal-700 uppercase tracking-widest">
+                 {sessionId ? sessionId.substring(0, 12) : 'STANDBY'}
+               </span>
+            </div>
           </div>
         </div>
         
@@ -187,8 +240,8 @@ export default function ExecutionControl() {
                         "h-11 w-11 rounded-xl flex items-center justify-center border transition-all",
                         status === 'idle' ? "bg-slate-50 border-slate-200 text-slate-400" :
                         status === 'verified' ? "bg-emerald-500 border-emerald-600 text-white shadow-md shadow-emerald-500/20" :
-                        status === 'failed' ? "bg-rose-500 border-rose-600 text-white shadow-md shadow-rose-500/20" :
-                        (status === 'needs review' || status === 'inconclusive' || status === 'planning') ? "bg-amber-500 border-amber-600 text-white shadow-md shadow-amber-500/20" :
+                        (status === 'failed' || status === 'blocked') ? "bg-rose-500 border-rose-600 text-white shadow-md shadow-rose-500/20" :
+                        (status === 'completed (unverified)' || status === 'needs review' || status === 'inconclusive' || status === 'planning') ? "bg-amber-500 border-amber-600 text-white shadow-md shadow-amber-500/20" :
                         "bg-teal-500 border-teal-600 text-white shadow-md shadow-teal-500/20"
                       )}>
                         {status === 'idle' && <Timer className="h-5 w-5" />}
@@ -196,17 +249,91 @@ export default function ExecutionControl() {
                         {status === 'executing' && <Play className="h-5 w-5 fill-current" />}
                         {status === 'completed' && <CheckCircle2 className="h-5 w-5" />}
                         {status === 'verified' && <CheckCircle2 className="h-5 w-5" />}
-                        {status === 'failed' && <AlertCircle className="h-5 w-5" />}
+                        {status === 'completed (unverified)' && <AlertTriangle className="h-5 w-5" />}
+                        {(status === 'failed' || status === 'blocked') && <AlertCircle className="h-5 w-5" />}
                         {status === 'needs review' && <ShieldCheck className="h-5 w-5" />}
                         {status === 'inconclusive' && <HelpCircle className="h-5 w-5" />}
                       </div>
                       <div className="flex flex-col gap-0.5">
                         <span className="text-xs font-bold text-slate-900 capitalize tracking-tight leading-none">{status} Status</span>
                         <span className="text-[10px] font-semibold text-slate-500">
-                          {metrics ? `${metrics.tasks_completed} / ${metrics.tasks_total} Tasks Completed (${((metrics.success_rate || 0)).toFixed(0)}%)` : 'Ready for prompt dispatch'}
+                          {metrics && metrics.tasks_total > 0 ? (
+                            `Verified: ${metrics.tasks_verified ?? 0} | Done: ${(metrics.tasks_completed ?? 0) + (metrics.tasks_verified ?? 0)} / ${metrics.tasks_total} (${(metrics.execution_progress_pct ?? 0).toFixed(0)}% exec, ${(metrics.verification_progress_pct ?? 0).toFixed(0)}% verif)`
+                          ) : 'Ready for prompt dispatch'}
                         </span>
                       </div>
                     </div>
+                    {metrics && metrics.tasks_total > 0 && (
+                      <div className="mt-3 pt-2.5 border-t border-slate-100 grid grid-cols-5 gap-1.5 text-center">
+                        <div className="bg-slate-50 rounded p-1">
+                          <span className="text-[8px] font-bold text-slate-400 block uppercase">Pending</span>
+                          <span className="text-[11px] font-bold text-slate-700">{metrics.tasks_pending ?? 0}</span>
+                        </div>
+                        <div className="bg-sky-50 rounded p-1">
+                          <span className="text-[8px] font-bold text-sky-600 block uppercase">Ready</span>
+                          <span className="text-[11px] font-bold text-sky-700">{metrics.tasks_ready ?? 0}</span>
+                        </div>
+                        <div className="bg-teal-50 rounded p-1">
+                          <span className="text-[8px] font-bold text-teal-600 block uppercase">Running</span>
+                          <span className="text-[11px] font-bold text-teal-700">{metrics.tasks_running ?? 0}</span>
+                        </div>
+                        <div className="bg-amber-50 rounded p-1">
+                          <span className="text-[8px] font-bold text-amber-600 block uppercase">Done (Unver)</span>
+                          <span className="text-[11px] font-bold text-amber-700">{metrics.tasks_completed ?? 0}</span>
+                        </div>
+                        <div className="bg-emerald-50 rounded p-1">
+                          <span className="text-[8px] font-bold text-emerald-600 block uppercase">Verified</span>
+                          <span className="text-[11px] font-bold text-emerald-700">{metrics.tasks_verified ?? 0}</span>
+                        </div>
+                        <div className="bg-rose-50 rounded p-1">
+                          <span className="text-[8px] font-bold text-rose-600 block uppercase">Failed</span>
+                          <span className="text-[11px] font-bold text-rose-700">{metrics.tasks_failed ?? 0}</span>
+                        </div>
+                        <div className="bg-zinc-100 rounded p-1">
+                          <span className="text-[8px] font-bold text-zinc-500 block uppercase">Blocked</span>
+                          <span className="text-[11px] font-bold text-zinc-700">{metrics.tasks_blocked ?? 0}</span>
+                        </div>
+                        <div className="bg-violet-50 rounded p-1">
+                          <span className="text-[8px] font-bold text-violet-600 block uppercase">Approval</span>
+                          <span className="text-[11px] font-bold text-violet-700">{metrics.tasks_approval_required ?? 0}</span>
+                        </div>
+                        <div className="bg-slate-100 rounded p-1">
+                          <span className="text-[8px] font-bold text-slate-500 block uppercase">Paused</span>
+                          <span className="text-[11px] font-bold text-slate-700">{metrics.tasks_paused ?? 0}</span>
+                        </div>
+                        <div className="bg-zinc-100 rounded p-1">
+                          <span className="text-[8px] font-bold text-zinc-500 block uppercase">Cancelled</span>
+                          <span className="text-[11px] font-bold text-zinc-700">{metrics.tasks_cancelled ?? 0}</span>
+                        </div>
+                      </div>
+                    )}
+                    {isFallbackPlan ? (
+                      <div className="mt-3 pt-2.5 border-t border-amber-100 flex items-start gap-2 text-amber-800 bg-amber-50/70 -mx-4 -mb-4 px-4 py-2.5">
+                        <AlertTriangle className="h-3.5 w-3.5 text-amber-600 mt-0.5 shrink-0" />
+                        <div className="flex flex-col gap-0.5">
+                          <span className="text-[10px] font-bold text-amber-900 uppercase tracking-wider">
+                            Heuristic Fallback Plan {primaryFailureCode ? `(${primaryFailureCode.replace(/_/g, ' ')})` : '(Primary AI Offline)'}
+                          </span>
+                          <span className="text-[9px] text-amber-700 leading-tight">
+                            {fallbackReason || "Fallback planning was used because the primary AI planning provider was unavailable."}
+                          </span>
+                          {planningLimitations && planningLimitations.length > 0 && (
+                            <span className="text-[9px] text-amber-800/90 leading-tight mt-0.5">
+                              {planningLimitations[0]}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    ) : (
+                      sessionId && (
+                        <div className="mt-3 pt-2 border-t border-slate-100 flex items-center justify-between text-[9px] text-slate-500">
+                          <span className="font-semibold uppercase tracking-wider text-teal-700">
+                            Planner: {planningMode === 'primary_ai' ? 'Primary AI Validated' : 'Deterministic Fallback'}
+                          </span>
+                          <span>Structural DAG Verified</span>
+                        </div>
+                      )
+                    )}
                   </div>
                 </section>
 
@@ -320,20 +447,20 @@ export default function ExecutionControl() {
                 </div>
 
                 {/* Phase 3 Objective C: Goal-Level Outcome Verification Summary */}
-                {goalVerification && (
+                {activeGoalVerif && (
                   <div className={cn(
                     "rounded-xl border p-3.5 space-y-2 shadow-xs",
-                    goalVerification.overall_status === 'verified' ? "bg-emerald-50/70 border-emerald-200" :
-                    goalVerification.overall_status === 'failed' ? "bg-rose-50/70 border-rose-200" :
-                    goalVerification.overall_status === 'needs_human_review' ? "bg-amber-50/70 border-amber-200" :
+                    activeGoalVerif.overall_status === 'verified' ? "bg-emerald-50/70 border-emerald-200" :
+                    activeGoalVerif.overall_status === 'failed' ? "bg-rose-50/70 border-rose-200" :
+                    (activeGoalVerif.overall_status === 'needs_human_review' || activeGoalVerif.overall_status === 'unverified') ? "bg-amber-50/70 border-amber-200" :
                     "bg-slate-50 border-slate-200"
                   )}>
                     <div className="flex items-center justify-between">
                       <div className="flex items-center gap-2">
                         <ShieldCheck className={cn(
                           "h-4 w-4",
-                          goalVerification.overall_status === 'verified' ? "text-emerald-700" :
-                          goalVerification.overall_status === 'failed' ? "text-rose-700" :
+                          activeGoalVerif.overall_status === 'verified' ? "text-emerald-700" :
+                          activeGoalVerif.overall_status === 'failed' ? "text-rose-700" :
                           "text-amber-700"
                         )} />
                         <span className="text-xs font-bold uppercase tracking-wider text-slate-900">
@@ -342,26 +469,29 @@ export default function ExecutionControl() {
                       </div>
                       <div className="flex items-center gap-2">
                         <span className="text-[10px] font-semibold text-slate-600">
-                          {(goalVerification.confidence_score * 100).toFixed(0)}% Confidence
+                          {(activeGoalVerif.confidence_score * 100).toFixed(0)}% Confidence
                         </span>
                         <span className={cn(
                           "text-[9px] font-bold px-2 py-0.5 rounded border uppercase tracking-wider",
-                          goalVerification.overall_status === 'verified' ? "bg-emerald-100 text-emerald-800 border-emerald-300" :
-                          goalVerification.overall_status === 'failed' ? "bg-rose-100 text-rose-800 border-rose-300" :
-                          goalVerification.overall_status === 'needs_human_review' ? "bg-amber-100 text-amber-800 border-amber-300" :
+                          activeGoalVerif.overall_status === 'verified' ? "bg-emerald-100 text-emerald-800 border-emerald-300" :
+                          activeGoalVerif.overall_status === 'failed' ? "bg-rose-100 text-rose-800 border-rose-300" :
+                          (activeGoalVerif.overall_status === 'needs_human_review' || activeGoalVerif.overall_status === 'unverified') ? "bg-amber-100 text-amber-800 border-amber-300" :
                           "bg-blue-100 text-blue-800 border-blue-300"
                         )}>
-                          {goalVerification.overall_status.replace(/_/g, ' ')}
+                          {activeGoalVerif.overall_status.replace(/_/g, ' ')}
                         </span>
                       </div>
                     </div>
                     <p className="text-[11px] text-slate-700">
-                      {goalVerification.explanation}
+                      {activeGoalVerif.explanation}
                     </p>
-                    <div className="flex items-center gap-4 text-[10px] text-slate-500 pt-1 border-t border-slate-200/60">
-                      <span>Tasks: <strong className="text-slate-700">{goalVerification.verified_tasks}/{goalVerification.total_tasks} Verified</strong></span>
-                      {goalVerification.failed_tasks > 0 && <span>Failed: <strong className="text-rose-600">{goalVerification.failed_tasks}</strong></span>}
-                      {goalVerification.inconclusive_tasks > 0 && <span>Inconclusive: <strong className="text-amber-600">{goalVerification.inconclusive_tasks}</strong></span>}
+                    <div className="flex flex-wrap items-center gap-3 text-[10px] text-slate-500 pt-1 border-t border-slate-200/60">
+                      <span>Tasks: <strong className="text-slate-700">{activeGoalVerif.verified_tasks}/{activeGoalVerif.total_tasks} Verified</strong></span>
+                      {activeGoalVerif.failed_tasks > 0 && <span>Failed: <strong className="text-rose-600">{activeGoalVerif.failed_tasks}</strong></span>}
+                      {(activeGoalVerif.blocked_tasks ?? 0) > 0 && <span>Blocked: <strong className="text-zinc-600">{activeGoalVerif.blocked_tasks}</strong></span>}
+                      {(activeGoalVerif.pending_tasks ?? 0) > 0 && <span>Pending: <strong className="text-slate-500">{activeGoalVerif.pending_tasks}</strong></span>}
+                      {(activeGoalVerif.ready_tasks ?? 0) > 0 && <span>Ready: <strong className="text-sky-600">{activeGoalVerif.ready_tasks}</strong></span>}
+                      {(activeGoalVerif.completed_unverified_tasks ?? 0) > 0 && <span>Unverified: <strong className="text-amber-600">{activeGoalVerif.completed_unverified_tasks}</strong></span>}
                       <span className="ml-auto flex items-center gap-1 text-[9px] text-slate-400">
                         <Lock className="h-3 w-3" /> Tenant Isolated
                       </span>
@@ -390,12 +520,12 @@ export default function ExecutionControl() {
                           <div className="flex flex-col items-end gap-1">
                             <span className={cn(
                               "text-[9px] font-bold px-2 py-0.5 rounded border uppercase tracking-wider",
-                              (ev.verification_status === 'verified' || ev.result?.success) ? "bg-emerald-50 text-emerald-700 border-emerald-200" :
+                              ev.verification_status === 'verified' ? "bg-emerald-50 text-emerald-700 border-emerald-200" :
                               (ev.verification_status === 'failed' || ev.status === 'failed') ? "bg-rose-50 text-rose-700 border-rose-200" :
-                              (ev.verification_status === 'needs_human_review') ? "bg-amber-50 text-amber-700 border-amber-200" :
+                              (ev.verification_status === 'unverified' || ev.verification_status === 'not_verified' || ev.verification_status === 'needs_human_review' || ev.verification_status === 'inconclusive') ? "bg-amber-50 text-amber-700 border-amber-200" :
                               "bg-slate-50 text-slate-700 border-slate-200"
                             )}>
-                              {ev.verification_status ? ev.verification_status.replace(/_/g, ' ') : (ev.result?.success ? 'VERIFIED' : (ev.status === 'completed' ? 'FAILED' : (ev.status ? String(ev.status).toUpperCase() : 'PENDING')))}
+                              {ev.verification_status ? ev.verification_status.replace(/_/g, ' ') : (ev.status === 'completed' ? 'UNVERIFIED' : (ev.status ? String(ev.status).toUpperCase() : 'PENDING'))}
                             </span>
                             {ev.confidence_score !== undefined && (
                               <span className="text-[9px] font-medium text-slate-500">
@@ -609,7 +739,9 @@ export default function ExecutionControl() {
                 <div className="grid grid-cols-2 gap-3">
                   <div className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-xs">
                     <span className="text-[9px] font-bold text-slate-400 uppercase tracking-wider block mb-1">Success Rate</span>
-                    <span className="text-xl font-bold text-slate-900">{(metrics?.success_rate || 0).toFixed(1)}%</span>
+                    <span className="text-xl font-bold text-slate-900">
+                      {(((metrics?.success_rate ?? 0) <= 1.0 ? (metrics?.success_rate ?? 0) * 100 : (metrics?.success_rate ?? 0))).toFixed(1)}%
+                    </span>
                   </div>
                   <div className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-xs">
                     <span className="text-[9px] font-bold text-slate-400 uppercase tracking-wider block mb-1">Avg Latency</span>
@@ -626,23 +758,65 @@ export default function ExecutionControl() {
                 </div>
 
                 <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-xs space-y-2.5">
-                  <h4 className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Queue Telemetry</h4>
+                  <h4 className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Queue & State Telemetry</h4>
                   <div className="space-y-2 text-xs">
                     <div className="flex justify-between items-center">
                       <span className="font-semibold text-slate-700">Tasks Total</span>
                       <span className="font-mono bg-slate-100 px-2 py-0.5 rounded font-bold">{metrics?.tasks_total || 0}</span>
                     </div>
                     <div className="flex justify-between items-center">
-                      <span className="font-semibold text-emerald-700">Completed</span>
-                      <span className="font-mono bg-emerald-50 text-emerald-700 px-2 py-0.5 rounded font-bold">{metrics?.tasks_completed || 0}</span>
+                      <span className="font-semibold text-slate-500">Pending</span>
+                      <span className="font-mono bg-slate-50 text-slate-600 px-2 py-0.5 rounded font-bold">{metrics?.tasks_pending || 0}</span>
                     </div>
                     <div className="flex justify-between items-center">
-                      <span className="font-semibold text-rose-700">Failed / Blocked</span>
-                      <span className="font-mono bg-rose-50 text-rose-700 px-2 py-0.5 rounded font-bold">{(metrics?.tasks_failed || 0) + (metrics?.tasks_blocked || 0)}</span>
+                      <span className="font-semibold text-sky-600">Ready</span>
+                      <span className="font-mono bg-sky-50 text-sky-700 px-2 py-0.5 rounded font-bold">{metrics?.tasks_ready || 0}</span>
                     </div>
                     <div className="flex justify-between items-center">
-                      <span className="font-semibold text-amber-700">Retries</span>
-                      <span className="font-mono bg-amber-50 text-amber-700 px-2 py-0.5 rounded font-bold">{metrics?.tasks_retried || 0}</span>
+                      <span className="font-semibold text-teal-600">Running</span>
+                      <span className="font-mono bg-teal-50 text-teal-700 px-2 py-0.5 rounded font-bold">{metrics?.tasks_running || 0}</span>
+                    </div>
+                    <div className="flex justify-between items-center">
+                      <span className="font-semibold text-violet-600">Waiting for Approval</span>
+                      <span className="font-mono bg-violet-50 text-violet-700 px-2 py-0.5 rounded font-bold">{metrics?.tasks_approval_required || 0}</span>
+                    </div>
+                    <div className="flex justify-between items-center">
+                      <span className="font-semibold text-slate-600">Paused</span>
+                      <span className="font-mono bg-slate-100 text-slate-700 px-2 py-0.5 rounded font-bold">{metrics?.tasks_paused || 0}</span>
+                    </div>
+                    <div className="flex justify-between items-center">
+                      <span className="font-semibold text-amber-700">Completed (Unverified)</span>
+                      <span className="font-mono bg-amber-50 text-amber-800 px-2 py-0.5 rounded font-bold">{metrics?.tasks_completed || 0}</span>
+                    </div>
+                    <div className="flex justify-between items-center">
+                      <span className="font-semibold text-emerald-700">Verified (Empirical Evidence)</span>
+                      <span className="font-mono bg-emerald-50 text-emerald-700 px-2 py-0.5 rounded font-bold">{metrics?.tasks_verified || 0}</span>
+                    </div>
+                    <div className="flex justify-between items-center">
+                      <span className="font-semibold text-rose-700">Failed</span>
+                      <span className="font-mono bg-rose-50 text-rose-700 px-2 py-0.5 rounded font-bold">{metrics?.tasks_failed || 0}</span>
+                    </div>
+                    <div className="flex justify-between items-center">
+                      <span className="font-semibold text-zinc-600">Blocked</span>
+                      <span className="font-mono bg-zinc-100 text-zinc-700 px-2 py-0.5 rounded font-bold">{metrics?.tasks_blocked || 0}</span>
+                    </div>
+                    <div className="flex justify-between items-center">
+                      <span className="font-semibold text-zinc-500">Cancelled</span>
+                      <span className="font-mono bg-zinc-100 text-zinc-700 px-2 py-0.5 rounded font-bold">{metrics?.tasks_cancelled || 0}</span>
+                    </div>
+                    <div className="flex justify-between items-center pt-2 border-t border-slate-100">
+                      <span className="font-semibold text-teal-800">Execution Progress</span>
+                      <span className="font-mono text-teal-900 font-bold">{(metrics?.execution_progress_pct || 0).toFixed(1)}%</span>
+                    </div>
+                    <div className="flex justify-between items-center">
+                      <span className="font-semibold text-emerald-800">Verification Progress</span>
+                      <span className="font-mono text-emerald-900 font-bold">{(metrics?.verification_progress_pct || 0).toFixed(1)}%</span>
+                    </div>
+                    <div className="flex justify-between items-center">
+                      <span className="font-semibold text-amber-700">Retries / Recoveries</span>
+                      <span className="font-mono bg-amber-50 text-amber-700 px-2 py-0.5 rounded font-bold">
+                        {metrics?.tasks_retried || 0} / {(metrics as any)?.recovery_count || 0}
+                      </span>
                     </div>
                   </div>
                 </div>

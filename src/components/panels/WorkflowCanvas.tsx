@@ -67,24 +67,41 @@ export default function WorkflowCanvas() {
       return { nodes: [], edges: [] };
     }
 
-    const rawNodes: Node[] = Array.from(nodeMap.values()).map(node => ({
-      id: node.task_id,
-      type: 'task',
-      position: { x: 0, y: 0 },
-      data: {
-        label: node.task_name,
-        status: node.status,
-        priorityScore: node.priority_score,
-        riskScore: node.risk_score,
-        retryCount: node.retry_count,
-        maxRetries: node.max_retries,
-        executionType: node.execution_type,
-        parallelGroup: node.parallel_group,
-        approvalNeeded: node.approval_needed,
-        taskId: node.task_id,
-        eta: node.estimated_execution_time ? `${node.estimated_execution_time.toFixed(1)}s` : undefined
-      }
-    }));
+    const rawNodes: Node[] = Array.from(nodeMap.values()).map(node => {
+      const isVer = Boolean(
+        node.status === 'verified' ||
+        node.is_verified ||
+        node.verification_status === 'verified'
+      );
+      const displayStatus = isVer
+        ? 'verified'
+        : (node.status === 'waiting' && node.is_ready)
+        ? 'ready'
+        : node.status;
+
+      return {
+        id: node.task_id,
+        type: 'task',
+        position: { x: 0, y: 0 },
+        data: {
+          label: node.task_name,
+          status: displayStatus,
+          priorityScore: node.priority_score,
+          riskScore: node.risk_score,
+          retryCount: node.retry_count,
+          maxRetries: node.max_retries,
+          executionType: node.execution_type,
+          parallelGroup: node.parallel_group,
+          approvalNeeded: node.approval_needed,
+          taskId: node.task_id,
+          failureReason: node.failure_reason,
+          verificationStatus: isVer ? 'verified' : (node.verification_status || 'unverified'),
+          isVerified: isVer,
+          artifactHash: node.artifact_hash,
+          eta: node.estimated_execution_time ? `${node.estimated_execution_time.toFixed(1)}s` : undefined
+        }
+      };
+    });
 
     const rawEdges: Edge[] = Array.from(nodeMap.values()).flatMap(node => 
       node.dependency_ids.map(depId => ({
